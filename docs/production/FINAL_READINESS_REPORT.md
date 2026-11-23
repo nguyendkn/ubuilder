@@ -2,148 +2,204 @@
 
 Date: 2026-11-23
 Host: Windows 10.0.26300 x64, 16 logical CPUs, Rust 1.99.1
+Source commit: `a4cd66d0e206670872a81622d8742231c316dd42`
 Version: `ubuilder 0.1.0`
-Verdict: **PRODUCTION_READY_WITH_LIMITATIONS**
 
-The workflow engine is production-ready for local, trusted-user use on Windows
-x64. It is not certified for Linux or macOS, not sandboxed against untrusted
-workflows, and not released with signing or a dependency vulnerability scan.
+**Verdict: `PRODUCTION_READY_WITH_LIMITATIONS` for the Windows x64
+trusted-native scope.** Isolated execution is `NOT_PRODUCTION_READY`. Cross-build
+certification covers only `windows-x64 -> windows-x64` with Rust and .NET.
 
-## 1. Implemented changes
+## 1. What was completed
 
-| Area | Change |
+| Area | Final change |
 | --- | --- |
-| Scheduling | Fail-fast no longer serializes matrix siblings; bounded concurrency slots; `cancel-in-progress` signals peers through the cancellation marker. |
-| Secrets | Env/file providers, masked values, fail-closed single resolution, redaction on every serialized surface, `ubuilder secret` CLI. |
-| State | Typed `RunState` and transition table for runs, jobs and steps; transactional validation; persisted legacy spellings. |
-| Cache | Step-scoped cache key; unrelated workflow edits no longer evict; corruption detection retained. |
-| Artifacts | Re-hash on upload, manifest verification, symlink containment, retention-safe publish. |
-| Retention | `maintenance stats/prune/gc/pin/unpin`; newest terminal runs kept, active runs skipped, pinned objects protected. |
-| Observability | Action steps now persist a redacted `stdout_tail` and a step log. |
-| Performance | 30 s toolchain facts cache and per-target capability cache; Criterion benchmarks. |
-| Automation | Daemon with git/workflow fingerprint polling, loopback webhook, staff trigger file and once mode. |
-| Release | Three-OS CI, tag-driven release workflow, deterministic packaging, checksums, CycloneDX SBOM, optional signing hook. |
-| Documentation | Audit, architecture, threat model, risks, gaps, roadmap, platform matrix, performance, security tests, release, operations, migration and this report. |
+| Schema safety | Schema v2; newer databases return `SCHEMA_UNSUPPORTED` before DDL; `VACUUM INTO` backup before migration. |
+| Concurrency | Generation-fenced leases, 60 s lease, 15 s heartbeat, cancellation on lease loss; `cancel-in-progress` releases the slot. |
+| Cache | Layered key: namespace + host + toolchain fingerprint + user key; corruption and traversal tests. |
+| Secrets | Per-job scoping, fail-closed resolution, global redaction, Windows ACL inheritance removal, reparse-point rejection. |
+| Filesystem | Canonicalized junction/symlink containment for artifacts and step paths. |
+| Isolation | Provider interface with native and Linux bubblewrap implementations; isolated mode fails closed, no fallback. |
+| Daemon/webhook | Required token, default loopback bind, 16 KiB headers, 64 KiB body, 60/60 s rate window, 1024-id replay cache, 401/405/409/413/429/202. |
+| Diagnostics | `doctor --all` diagnoses every canonical target in a single envelope. |
+| Release | Arch-specific archives, `scripts/manifest.py`, deterministic packaging, SBOM, checksums, smoke tests, release workflow. |
+| Tests | New .NET executable fixture, artifact corruption test, `doctor --all` contract, structural scheduling assertions. |
 
-No second scheduler was introduced. Legacy `build`, `package` and `release`
-commands remain functional.
+Legacy `build`, `package`, `release`, YAML v1, SQLite data, artifact references,
+`{ok,command,data}` envelopes and exit codes 0/1/2/3/130 are preserved.
 
-## 2. Resolved defects
+## 2. Gate results
 
-| ID | Defect | Verification |
+Command: `cargo test --all-targets --locked`, final run exit 0.
+
+| Gate | Status | Basis |
 | --- | --- | --- |
-| B-01 | Fail-fast forced matrix concurrency to 1 | `fail_fast_does_not_serialize_matrix_siblings` |
-| B-02 | No secret provider or fail-closed resolution | `missing_secret_fails_closed_before_running_jobs`, `secrets_are_injected_and_redacted_everywhere` |
-| B-03 | Artifact upload did not re-hash | `builds::rust_fixture_builds_with_manifest_and_validated_artifact` plus unit tests |
-| B-04 | Unvalidated lifecycle strings could move terminal runs backwards | `terminal_run_state_cannot_transition_back_to_running` (`STATE_INVALID`) |
-| B-05 | Cache invalidated by unrelated workflow edits | `cache_survives_unrelated_workflow_edits` |
-| B-06 | Unbounded run/artifact growth | `maintenance_prune_keeps_newest_runs_and_protects_active`, `maintenance_pin_protects_and_gc_removes_unreferenced_objects` |
-| B-07 | `concurrency.max > 1` ignored; `cancel-in-progress` parsed only | `concurrency_group_serializes_jobs_without_deadlock`; peer cancellation code path |
-| B-08 | Action steps had no output/log | `action_steps_capture_message_output` |
-| B-09 | Symlink/ZIP escape gaps | `copy_tree_rejects_symlinks_escaping_the_root` (Unix), `extraction_rejects_traversal_entries` |
-| B-10 | Planning dominated by toolchain probes | Criterion: 4.5 s cold -> 71 ms warm |
-| B-11 | Triggers were metadata only | `daemon_once_runs_the_workflow_and_records_state`; manual polling/webhook checks |
-| B-12 | No release pipeline/SBOM | `release.yml`, `scripts/package.py`, `scripts/sbom.py`, verified local artifact |
+| G01 Static gates | PASS | fmt and clippy `-D warnings` pass |
+| G02 Test suite | PASS (Windows) | 172/172 pass |
+| G03 Isolated execution | BLOCKED | fail-closed behavior passes; no verified backend |
+| G04 Filesystem/secrets | PASS | 16 adversarial PASS, 2 BLOCKED |
+| G05 State/data safety | PASS | schema, lease and retention tests |
+| G06 Pipeline semantics | PASS | 27 runtime + 7 contract tests |
+| G07 Portability | BLOCKED | no Linux/macOS/ARM64 execution, no CI run |
+| G08 Daemon/webhook | PASS | 4 daemon tests + rate/constant-time unit test |
+| G09 Supply chain/release | BLOCKED | no audit, no signature |
+| G10 Performance | PASS with disclosed regression | parse/compile within policy; warm plan +46.6% |
 
-## 3. Actual test results
+Machine-readable details: `READINESS_GATES.json`, `READINESS_EVIDENCE.md`.
 
-Command: `cargo test --all-targets --locked` (final run, 102.34 s wall).
+## 3. Tests
 
 | Suite | Passed | Failed |
 | --- | ---: | ---: |
-| Library unit tests | 100 | 0 |
-| `tests/builds.rs` | 1 | 0 |
+| Library unit tests | 123 | 0 |
+| `src/main.rs` | 0 | 0 |
+| `tests/builds.rs` | 2 | 0 |
 | `tests/cli.rs` | 6 | 0 |
-| `tests/compatibility.rs` | 2 | 0 |
+| `tests/compatibility.rs` | 3 | 0 |
+| `tests/daemon.rs` | 4 | 0 |
 | `tests/pipeline_contract.rs` | 7 | 0 |
-| `tests/pipeline_runtime.rs` | 23 | 0 |
-| **Total** | **139** | **0** |
+| `tests/pipeline_runtime.rs` | 27 | 0 |
+| **Total** | **172** | **0** |
 
-`cargo fmt --all -- --check`: pass.
-`cargo clippy --all-targets -- -D warnings`: pass.
-`cargo build --release --locked`: pass.
+Log: `target/finalization-final.log`; clippy log:
+`target/finalization-clippy.log`. Release build: `cargo build --release
+--locked`, exit 0.
 
-Criterion benchmarks (`cargo test --all-targets` runs them in test mode; the
-timings below are from the dedicated benchmark run):
+Timing tests were made structural during finalization: parallel, fail-fast and
+concurrency behavior is proven by marker-file intervals, not wall-clock
+thresholds that failed under a loaded 27-test binary.
 
-| Benchmark | Result |
+## 4. Native fixtures
+
+| Fixture | Result |
 | --- | --- |
-| Parse + validate 12 jobs / 48 expanded | 234.69 µs |
-| Compile + expand | 403.61 µs |
-| Plan 48 jobs, warm | 71.31 ms |
-| Plan 48 jobs, cold | ~4.5 s |
+| Rust CLI (`fixtures/rust-cli`) | Built for `windows-x64`; ZIP validated; manifest and SQLite record verified. |
+| .NET console (`fixtures/dotnet-console`, `net10.0`) | Built with SDK 11.0.100; all validations passed; extracted `HelloDotnet.exe` printed `hello from HelloDotnet`. |
+| Electron | Detection verified; packaging UNVERIFIED (`electron-builder` absent). |
+| Tauri | Detection verified; packaging UNVERIFIED (`tauri` absent). |
 
-## 4. Cross-platform evidence
+## 5. Security
 
-| Platform | Build | Tests | Native fixture | Evidence |
-| --- | --- | --- | --- | --- |
-| Windows x64 | pass | 139/139 | pass | This host |
-| Linux x64 | **not verified** | CI configured | not run | Cross build fails: `x86_64-linux-gnu-gcc` not found |
-| macOS | **not verified** | CI configured | not run | No host/SDK; CI never executed here |
+- 18 adversarial cases: 16 PASS, 2 BLOCKED (Unix symlink execution, sandbox
+  escape). Full list in `adversarial-matrix.json`.
+- Webhook authentication is mandatory; token is passed to the detached child only
+  through the environment.
+- No verified Windows sandbox. `security.mode: isolated` returns
+  `SECURITY_CAPABILITY_UNAVAILABLE` (exit 3) rather than running natively.
+- Dependency audit is BLOCKED: `cargo-audit`/`cargo-deny` absent and no advisory
+  database queried. The CI audit job is configuration, not a run.
 
-Exact cross-build blocker:
+## 6. Cross-platform status
 
-```text
-error occurred in cc-rs: failed to find tool "x86_64-linux-gnu-gcc": program not found
-```
+| Host -> target | Status | Evidence |
+| --- | --- | --- |
+| windows-x64 -> windows-x64 (Rust, .NET) | SUPPORTED | executed here |
+| windows-x64 -> windows-x64 (Electron, Tauri) | CONDITIONAL | detection only |
+| windows-x64 -> windows-arm64 | UNVERIFIED | no host |
+| windows-x64 -> linux-x64 / linux-arm64 | UNVERIFIED | no linker; cross build failed |
+| windows-x64 -> macos-x64 / macos-arm64 / macos-universal | UNVERIFIED | no SDK/host |
 
-No Linux or macOS binary is claimed. CI covers Windows, Ubuntu and macOS and
-includes format, clippy, tests and a release build.
+CI defines Windows, Ubuntu, macOS x64 and macOS arm64 jobs. It has not run in
+this environment. No Linux, macOS or ARM64 binary is certified.
 
-## 5. Security audit
+## 7. Performance
 
-- Secret values are masked in Debug, redacted in report/log/error/JSON surfaces,
-  resolved fail-closed before jobs, and never printed by the secret CLI.
-- Traversal and artifact integrity tests pass; symlink containment is
-  Unix-only and did not execute on this host.
-- Lifecycle transitions are transactional.
-- Retention never deletes active runs or pinned objects.
-- Daemon webhook is loopback-only, POST-only, optional bearer token; manual
-  checks returned 401 (missing token), 405 (wrong method), 202 (authorized).
-- Dependency vulnerability scan: **BLOCKED** (`cargo-audit`, `cargo-deny`,
-  `cargo-nextest` and `cargo-fuzz` absent). SBOM generated but is not a scan.
-- No OS sandbox; workflows run with the invoking user's permissions.
+`cargo bench --bench pipeline --locked -- --sample-size 30 --measurement-time 3
+--warm-up-time 1`:
 
-## 6. Release artifact inventory
+| Benchmark | Baseline | Final | Change |
+| --- | --- | ---: | ---: |
+| Parse + validate 48 expanded | 234.69 µs | 271.88 µs [261.81, 282.45] | +15.8% |
+| Compile + expand | 403.61 µs | 477.68 µs [460.59, 494.62] | +18.3% |
+| Plan 48 jobs, warm | 71.31 ms | 104.57 ms [100.69, 109.02] | +46.6% |
 
-Local artifacts in `dist/` (ignored by git):
+Repeated runs produced 270.56-280.90 µs, 489.44-565.19 µs and 101.43-112.66 ms.
+Parse/compile are under the 20% blocking threshold. Warm planning exceeded it;
+no planner/provider code changed and Criterion frequently reported `p > 0.05`
+against the preceding run, so host variance is the likely cause. The regression
+is disclosed, not waived. Cold planning was not re-measured.
+
+## 8. Release artifacts
 
 | File | Size | SHA-256 |
 | --- | ---: | --- |
-| `ubuilder-windows-x64.zip` | 3.6 MiB | `7b18aca911391849b3de0035ee1173be76b9ceab14d3972fdbc81c9eb911b65a` |
-| `sbom.cdx.json` | 98 KiB | `b3ba576aec19310f886f956aa51233accf809044044f5de977d533e5ead0cea2` |
-| `SHA256SUMS` | 173 B | verifies both files |
+| `ubuilder-windows-x64.zip` | see `RELEASE_VERIFICATION.md` | see `RELEASE_VERIFICATION.md` |
+| `sbom.cdx.json` | see `RELEASE_VERIFICATION.md` | see `RELEASE_VERIFICATION.md` |
+| `release-manifest.json` | generated after packaging | covers archives and SBOM |
+| `SHA256SUMS` | generated last | covers every other file |
 
-The archive contains `ubuilder.exe`, README and docs (24 entries); the binary
-reports `ubuilder 0.1.0` and `doctor --json` returns a valid envelope. The SBOM
-is CycloneDX 1.5 with 168 components and 168 dependency nodes.
+The extracted binary reports `ubuilder 0.1.0`; `--json doctor --all` exits 0
+with all seven targets; `target list --json` exits 0 with seven entries. Signing
+status is `UNSIGNED`; no signature or notarization is claimed.
 
-The tag-driven GitHub release workflow has not executed from this environment.
-No Linux/macOS archive or signature is claimed.
+## 9. Remaining limitations
 
-## 7. Remaining limitations
+1. Linux, macOS and ARM64 were not executed; CI has no run record.
+2. No Linux cross-linker (`x86_64-linux-gnu-gcc` absent).
+3. No verified isolation backend on any platform; isolated mode fails closed.
+4. No dependency vulnerability scan.
+5. Unsigned artifacts; no notarization or published GitHub release.
+6. Warm planning regressed and cold planning was not re-measured.
+7. Electron/Tauri packaging unverified; detection only.
+8. Webhook is plaintext loopback with in-memory, non-durable replay protection.
+9. Facts cache is process-local with a 30 s TTL.
+10. No remote executors, containers/WSL backends or native installers.
 
-1. Linux and macOS are not executed; only Windows x64 is verified.
-2. Cross-compilation lacks a linker; `linker-unverified`.
-3. No dependency vulnerability scan.
-4. No OS sandbox for untrusted workflows.
-5. No code signing, macOS notarization, or published release.
-6. Daemon webhook is plaintext loopback; no TLS, replay window or rate limit.
-7. Detached daemon webhook behavior was manually checked, not automated in CI.
-8. `cancel-in-progress` uses the cancel marker but has no dedicated test.
-9. Concurrency slots are recovered by a 1 h lease, not a heartbeat.
-10. A newer SQLite schema version is not rejected.
-11. Cold planning costs ~4.5 s because the facts cache is per-process; each
-    daemon-triggered CLI run pays that cost.
-12. Remote actions, container/WSL backends and native installers are not
-    implemented.
+## 10. Machine-readable verdict
 
-## 8. Verdict
-
-**PRODUCTION_READY_WITH_LIMITATIONS**
-
-All correctness, security (except dependency audit and sandboxing), retention,
-recovery, performance and Windows release gates pass with 139 tests and verified
-benchmarks. Full production readiness is withheld because Linux/macOS execution,
-dependency audit, signing and an actual CI/release run are blocked in this
-environment. Each blocker is named above; none is reported as verified.
+```json
+{
+  "product": "ubuilder",
+  "version": "0.1.0",
+  "commit": "a4cd66d0e206670872a81622d8742231c316dd42",
+  "verified_at": "2026-11-23T16:01:50Z",
+  "host": "windows-10.0.26300-x64",
+  "core_production": {
+    "status": "PRODUCTION_READY_WITH_LIMITATIONS",
+    "scope": "Windows x64, trusted-native execution, local release",
+    "gates_passed": ["G01", "G02", "G04", "G05", "G06", "G08", "G10"],
+    "gates_blocked": ["G09"],
+    "blockers": [
+      "no dependency audit",
+      "unsigned artifacts",
+      "no CI run",
+      "Linux/macOS/ARM64 not executed"
+    ]
+  },
+  "isolated_execution_production": {
+    "status": "NOT_PRODUCTION_READY",
+    "gates_blocked": ["G03", "G07"],
+    "blockers": [
+      "no verified sandbox backend",
+      "fail-closed path is verified but isolation itself is unexecuted"
+    ]
+  },
+  "cross_build_production": {
+    "status": "CONDITIONAL",
+    "certified_combinations": [
+      {
+        "host": "windows-x64",
+        "target": "windows-x64",
+        "frameworks": ["rust", "dotnet"],
+        "status": "SUPPORTED"
+      }
+    ],
+    "conditional_combinations": [
+      {
+        "host": "windows-x64",
+        "target": "windows-x64",
+        "frameworks": ["electron", "tauri"],
+        "status": "CONDITIONAL",
+        "reason": "detection verified, packaging toolchain unavailable"
+      }
+    ],
+    "unverified_combinations": [
+      "windows-x64 -> windows-arm64",
+      "windows-x64 -> linux-x64",
+      "windows-x64 -> linux-arm64",
+      "windows-x64 -> macos-x64",
+      "windows-x64 -> macos-arm64",
+      "windows-x64 -> macos-universal"
+    ]
+  }
+}
+```

@@ -107,14 +107,15 @@ analysis: `docs/production/PERFORMANCE_BASELINE.md`.
 
 | Benchmark | Baseline | Final |
 | --- | --- | --- |
-| Parse + validate 48 jobs | 234.69 µs | 272.60 µs |
-| Compile + expand | 403.61 µs | 446.59 µs |
-| Plan 48 jobs, warm | 71.31 ms | 90.03 ms |
-| Plan 48 jobs, cold | ~4.5 s | not separately instrumented; toolchain probes remain dominant |
+| Parse + validate 48 jobs | 234.69 µs | 271.88 µs [261.81, 282.45] |
+| Compile + expand | 403.61 µs | 477.68 µs [460.59, 494.62] |
+| Plan 48 jobs, warm | 71.31 ms | 104.57 ms [100.69, 109.02] |
+| Plan 48 jobs, cold | ~4.5 s | not measured after finalization |
 
-Parse and compile changes are below the 20% blocking threshold defined by the
-performance policy. Warm planning is 26% higher and is explained, not required to
-block; no planner code changed during finalization.
+Parse (+15.8%) and compile (+18.3%) are below the 20% blocking threshold. Warm
+planning is 46.6% above the stored baseline; repeated runs ranged from 101.43 ms
+to 112.66 ms with `p > 0.05` against the preceding run, and no planner/provider
+code changed. The regression is disclosed, not certified neutral.
 
 ## Release evidence
 

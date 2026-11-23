@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "product": "ubuilder",
+  "version": "0.1.0",
+  "commit": "a4cd66d0e206670872a81622d8742231c316dd42",
+  "verified_at": "2026-11-23T16:01:50Z",
+  "host": {
+    "os": "windows",
+    "version": "10.0.26300",
+    "architecture": "x64",
+    "rust": "1.99.1"
+  },
+  "gates": [
+    {
+      "id": "G01",
+      "name": "Static quality gates",
+      "status": "PASS",
+      "required": true,
+      "scope": "CORE_PRODUCTION",
+      "evidence": [
+        "cargo fmt --all -- --check (exit 0)",
+        "cargo clippy --all-targets --locked -- -D warnings (exit 0)",
+        "target/finalization-clippy.log"
+      ],
+      "blockers": [],
+      "verified_at": "2026-11-23T16:01:50Z"
+    },
+    {
+      "id": "G02",
+      "name": "Automated test suite",
+      "status": "PASS",
+      "required": true,
+      "scope": "CORE_PRODUCTION",
+      "evidence": [
+        "cargo test --all-targets --locked: 172 passed, 0 failed, exit 0",
+        "target/finalization-final.log",
+        "tests/builds.rs (Rust and .NET fixture execution)",
+        "tests/pipeline_runtime.rs (27 runtime tests)"
+      ],
+      "blockers": [
+        "Only Windows x64 was executed; Linux and macOS suites are unexecuted."
+      ],
+      "verified_at": "2026-11-23T16:01:50Z"
+    },
+    {
+      "id": "G03",
+      "name": "Isolated execution",
+      "status": "BLOCKED",
+      "required": true,
+      "scope": "ISOLATED_EXECUTION_PRODUCTION",
+      "evidence": [
+        "tests/pipeline_runtime.rs::isolated_mode_fails_closed_without_a_backend",
+        "src/pipeline/isolation.rs: fail-closed provider selection"
+      ],
+      "blockers": [
+        "No verified sandbox backend is installed on Windows.",
+        "No Linux or macOS host executed the Bubblewrap or sandbox-exec paths.",
+        "Fail-closed behavior is PASS; isolation itself is UNVERIFIED."
+      ],
+      "verified_at": "2026-11-23T16:01:50Z"
+    },
+    {
+      "id": "G04",
+      "name": "Filesystem and secret security",
+      "status": "PASS",
+      "required": true,
+      "scope": "CORE_PRODUCTION",
+      "evidence": [
+        "docs/production/adversarial-matrix.json: 16 PASS, 2 BLOCKED",
+        "docs/production/SECURITY_TEST_REPORT.md",
+        "tests: path traversal, junction escape, artifact corruption, ZIP traversal, per-job secret scope, ACL inheritance"
+      ],
+      "blockers": [
+        "Unix symlink escape and sandbox escape cases are BLOCKED on this host."
+      ],
+      "verified_at": "2026-11-23T16:01:50Z"
+    },
+    {
+      "id": "G05",
+      "name": "State and data safety",
+      "status": "PASS",
+      "required": true,
+      "scope": "CORE_PRODUCTION",
+      "evidence": [
+        "storage::tests::newer_schema_is_rejected_before_ddl",
+        "storage::tests::version_one_database_is_backed_up_and_migrated",
+        "storage::tests::expired_lease_cannot_be_renewed_or_released_by_the_old_owner",
+        "maintenance retention and GC tests"
+      ],
+      "blockers": [],
+      "verified_at": "2026-11-23T16:01:50Z"
+    },
+    {
+      "id": "G06",
+      "name": "Pipeline semantics",
+      "status": "PASS",
+      "required": true,
+      "scope": "CORE_PRODUCTION",
+      "evidence": [
+        "27 tests in tests/pipeline_runtime.rs",
+        "7 contract tests in tests/pipeline_contract.rs",
+        "marker-interval proofs for parallel, fail-fast and serialized concurrency"
+      ],
+      "blockers": [],
+      "verified_at": "2026-11-23T16:01:50Z"
+    },
+    {
+      "id": "G07",
+      "name": "Platform and cross-build portability",
+      "status": "BLOCKED",
+      "required": true,
+      "scope": "CROSS_BUILD_PRODUCTION",
+      "evidence": [
+        "docs/production/CROSS_PLATFORM_MATRIX.md",
+        "doctor --all on Windows x64",
+        "tests/compatibility.rs"
+      ],
+      "blockers": [
+        "No Ubuntu or macOS execution.",
+        "No CI run record.",
+        "No Linux linker; cross-link failed before finalization.",
+        "Only windows-x64 host to windows-x64 target is certified."
+      ],
+      "verified_at": "2026-11-23T16:01:50Z"
+    },
+    {
+      "id": "G08",
+      "name": "Daemon and webhook operations",
+      "status": "PASS",
+      "required": true,
+      "scope": "CORE_PRODUCTION",
+      "evidence": [
+        "tests/daemon.rs: lifecycle, stale pid, webhook auth/limits/replay, token environment isolation",
+        "cli::daemon::tests::rate_limit_and_constant_time_comparison"
+      ],
+      "blockers": [
+        "No Git event source; push/tag/branch triggers are NOT_APPLICABLE."
+      ],
+      "verified_at": "2026-11-23T16:01:50Z"
+    },
+    {
+      "id": "G09",
+      "name": "Supply chain and release integrity",
+      "status": "BLOCKED",
+      "required": true,
+      "scope": "CORE_PRODUCTION",
+      "evidence": [
+        "docs/production/RELEASE_VERIFICATION.md",
+        "release-manifest.json, sbom.cdx.json and SHA256SUMS in dist/",
+        "extracted archive smoke tests (version, doctor --all, target list)"
+      ],
+      "blockers": [
+        "No dependency audit was executed (cargo-audit/cargo-deny absent, no advisory DB query).",
+        "Artifacts are UNSIGNED; no signature or notarization verification.",
+        "No CI run produced these artifacts."
+      ],
+      "verified_at": "2026-11-23T16:01:50Z"
+    },
+    {
+      "id": "G10",
+      "name": "Performance baseline",
+      "status": "PASS",
+      "required": true,
+      "scope": "CORE_PRODUCTION",
+      "evidence": [
+        "target/finalization-bench.log",
+        "docs/production/PERFORMANCE_BASELINE.md"
+      ],
+      "blockers": [
+        "Warm planning regressed versus the stored baseline; host variance was high and disclosed."
+      ],
+      "verified_at": "2026-11-23T16:01:50Z"
+    }
+  ],
+  "verdicts": {
+    "CORE_PRODUCTION": {
+      "status": "PRODUCTION_READY_WITH_LIMITATIONS",
+      "scope": "Windows x64, trusted-native execution, local release",
+      "passing_gates": ["G01", "G02", "G04", "G05", "G06", "G08", "G10"],
+      "blocked_gates": ["G09"],
+      "unverified_scopes": ["Linux x64", "macOS x64", "macOS arm64", "Windows arm64"]
+    },
+    "ISOLATED_EXECUTION_PRODUCTION": {
+      "status": "NOT_PRODUCTION_READY",
+      "scope": "security.mode: isolated",
+      "passing_gates": [],
+      "blocked_gates": ["G03", "G07"],
+      "note": "Fails closed with SECURITY_CAPABILITY_UNAVAILABLE (exit 3); no backend is certified."
+    },
+    "CROSS_BUILD_PRODUCTION": {
+      "status": "CONDITIONAL",
+      "certified_combinations": [
+        {
+          "host": "windows-x64",
+          "target": "windows-x64",
+          "frameworks": ["rust", "dotnet"],
+          "status": "SUPPORTED"
+        }
+      ],
+      "conditional_combinations": [
+        {
+          "host": "windows-x64",
+          "target": "windows-x64",
+          "frameworks": ["electron", "tauri"],
+          "status": "CONDITIONAL",
+          "reason": "detection verified; packaging toolchain unavailable"
+        }
+      ],
+      "unverified_combinations": [
+        "windows-x64 -> windows-arm64",
+        "windows-x64 -> linux-x64",
+        "windows-x64 -> linux-arm64",
+        "windows-x64 -> macos-x64",
+        "windows-x64 -> macos-arm64",
+        "windows-x64 -> macos-universal"
+      ]
+    }
+  }
+}

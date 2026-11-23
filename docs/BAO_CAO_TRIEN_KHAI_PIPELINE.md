@@ -5,6 +5,8 @@
 **Phạm vi:** Nâng cấp `ubuilder` từ công cụ build desktop đa nền tảng thành workflow engine CI/CD cục bộ, khai báo bằng YAML qua `ubuilder pipeline`; bổ sung vận hành, bảo mật, phát hành và tài liệu production.  
 **Trạng thái:** `PRODUCTION_READY_WITH_LIMITATIONS` trên Windows x64. Legacy `build` / `package` / `release` vẫn hoạt động.
 
+> **Phụ lục finalization (23/11/2026):** báo cáo này được viết ở mốc trước khi hoàn tất. Các số liệu cũ (139 test, hash `dist/`, commit `dc3de80`, "webhook token tùy chọn", "chưa có rate limit", "không có sandbox") đã được thay bằng kết quả cuối tại `docs/production/FINAL_READINESS_REPORT.md`, `READINESS_GATES.json`, `READINESS_EVIDENCE.md` và `RELEASE_VERIFICATION.md`. Commit mã nguồn cuối: `a4cd66d0e206670872a81622d8742231c316dd42`. Tổng số test cuối: **172** (123 unit, 2 builds, 6 cli, 3 compatibility, 4 daemon, 7 pipeline_contract, 27 pipeline_runtime), tất cả đạt. Các thay đổi chính: fencing + heartbeat cho concurrency lease; schema v2 với `SCHEMA_UNSUPPORTED` và backup `VACUUM INTO`; cache key phân lớp; secret theo từng job và ACL Windows; chống escape junction/symlink; provider isolation fail-closed; webhook bắt buộc token, giới hạn header/body/rate/replay; `doctor --all`; manifest phát hành có hash/SBOM/smoke test. Ma trận nền tảng: chỉ `windows-x64 -> windows-x64` (Rust, .NET) được chứng nhận; Linux/macOS/ARM64, CI, audit phụ thuộc, ký số và sandbox đều **BLOCKED**. Warm planning đo lại 104.57 ms so với baseline 71.31 ms; regression được công bố, không che giấu.
+
 ---
 
 ## 1. Tóm tắt điều hành
