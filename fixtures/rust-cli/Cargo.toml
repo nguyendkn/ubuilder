@@ -1,0 +1,9 @@
+[package]
+name = "hello-rust"
+version = "0.2.0"
+edition = "2021"
+description = "Minimal Rust CLI fixture for ubuilder integration tests"
+
+[[bin]]
+name = "hello-rust"
+path = "src/main.rs"

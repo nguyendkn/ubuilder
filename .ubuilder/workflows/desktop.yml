@@ -1,0 +1,58 @@
+version: 1
+name: Desktop Build
+"on":
+  manual: true
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build and package
+    runs-on: auto
+    timeout: 30m
+    steps:
+      - id: checkout
+        uses: builtin/checkout@v1
+      - id: setup
+        uses: builtin/setup-rust@v1
+      - id: build
+        name: Build
+        uses: builtin/build@v1
+        with:
+          target: native
+          profile: release
+      - id: package
+        name: Package
+        uses: builtin/package@v1
+        with:
+          target: native
+          format: zip
+      - id: checksums
+        uses: builtin/checksum@v1
+        with:
+          path: dist
+          output: dist/checksums.sha256
+      - id: upload
+        uses: builtin/upload-artifact@v1
+        with:
+          name: desktop-build
+          path: dist
+
+  report:
+    name: Report artifact
+    needs: [build]
+    runs-on: auto
+    steps:
+      - id: download
+        uses: builtin/download-artifact@v1
+        with:
+          name: desktop-build
+          path: dist
+      - id: verify-checksums
+        name: Verify checksums
+        run: |
+          echo "downloaded artifacts:"
+          ls dist

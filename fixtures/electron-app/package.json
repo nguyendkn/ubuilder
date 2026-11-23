@@ -1,0 +1,24 @@
+{
+  "name": "electron-fixture",
+  "version": "1.0.0",
+  "description": "Minimal Electron fixture for ubuilder integration tests",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^38.0.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "io.example.electronfixture",
+    "productName": "ElectronFixture",
+    "files": [
+      "main.js",
+      "index.html"
+    ],
+    "directories": {
+      "output": "dist"
+    }
+  }
+}

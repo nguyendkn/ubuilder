@@ -1,0 +1,61 @@
+# Native build matrix with caching and artifacts.
+# Validate: ubuilder pipeline validate --file examples/native-matrix.yml
+version: 1
+name: Native Matrix
+
+"on":
+  manual: true
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    steps:
+      - uses: builtin/checkout@v1
+      - uses: builtin/setup-rust@v1
+        with:
+          channel: stable
+      - uses: builtin/cache@v1
+        with:
+          key: cargo-target-v1
+          path: target
+      - run: cargo test --locked
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [test]
+    strategy:
+      matrix:
+        target: [native]
+      fail-fast: true
+    steps:
+      - uses: builtin/checkout@v1
+      - uses: builtin/setup-rust@v1
+      - uses: builtin/build@v1
+        with:
+          target: ${{ matrix.target }}
+          profile: release
+      - uses: builtin/package@v1
+        with:
+          format: zip
+      - uses: builtin/checksum@v1
+        with:
+          path: dist
+      - uses: builtin/upload-artifact@v1
+        with:
+          name: desktop-${{ matrix.target }}
+          path: dist
+
+  summary:
+    name: Summarize
+    needs: [build]
+    steps:
+      - uses: builtin/download-artifact@v1
+        with:
+          pattern: desktop-*
+          path: release
+      - run: echo "downloaded ${{ needs.build.result }} artifacts"

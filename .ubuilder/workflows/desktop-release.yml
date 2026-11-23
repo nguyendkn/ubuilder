@@ -1,0 +1,69 @@
+version: 1
+name: Desktop Release
+"on":
+  manual: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: auto
+    steps:
+      - uses: builtin/checkout@v1
+      - uses: builtin/setup-rust@v1
+        with:
+          channel: stable
+      - name: Unit tests
+        run: cargo test --locked
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [test]
+    runs-on: auto
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        target:
+          - windows-x64
+    steps:
+      - uses: builtin/checkout@v1
+      - uses: builtin/setup-rust@v1
+      - name: Build
+        uses: builtin/build@v1
+        with:
+          framework: auto
+          target: ${{ matrix.target }}
+          profile: release
+      - name: Package
+        uses: builtin/package@v1
+        with:
+          target: ${{ matrix.target }}
+          format: zip
+      - name: Validate
+        uses: builtin/verify@v1
+      - name: Upload artifact
+        uses: builtin/upload-artifact@v1
+        with:
+          name: desktop-${{ matrix.target }}
+          path: dist
+
+  release:
+    name: Assemble release
+    needs: [build]
+    runs-on: auto
+    steps:
+      - uses: builtin/download-artifact@v1
+        with:
+          pattern: desktop-*
+          path: dist
+      - uses: builtin/checksum@v1
+        with:
+          path: dist
+          output: dist/checksums.sha256
+      - uses: builtin/upload-artifact@v1
+        with:
+          name: release-checksums
+          path: dist/checksums.sha256
