@@ -45,9 +45,9 @@ flowchart LR
   per-base-id semaphore.
 - Fail-fast stops *new* sibling scheduling. It does not cancel running
   siblings and never changes the concurrency limit.
-- A job acquires a bounded concurrency slot before its body and releases it
-  after the body. Slots have a 1 h lease for crash tolerance; normal completion
-  deletes the slot.
+- A job acquires a generation-fenced concurrency slot before its body and
+  releases it after the body. The lease is 60 s, renewed every 15 s; loss of
+  renewal cancels the job. Normal completion deletes the slot.
 - Run, job and step writes are validated against a transition table inside a
   SQLite transaction.
 - Cancellation is cooperative: an in-process token plus a `cancel` marker file,
@@ -57,8 +57,9 @@ flowchart LR
 
 SQLite is the source of truth for run history, jobs, steps, artifact references,
 cache entries, concurrency slots, pins and schema version. `schema_migrations`
-records version 1. The current code creates the schema idempotently but does not
-reject a *newer* schema version; downgrade safety is a known limitation.
+records version 2. A database with a newer version is rejected with
+`SCHEMA_UNSUPPORTED` before DDL, and a non-empty database is backed up with
+`VACUUM INTO` before migration.
 
 Artifact objects are content-addressed. Deleting a run removes only its rows and
 run directory; objects survive until `maintenance gc`, so shared objects remain
@@ -66,11 +67,12 @@ valid. Pinned objects are never collected.
 
 ## Secrets
 
-Secrets are resolved once per run from names referenced in the IR. Resolution is
-fail-closed before any job starts. Raw values are kept in memory for `needs`
+Secrets are resolved once per run from names referenced in the IR, then scoped
+per job (`secrets_by_job`) to the names that job actually references. Resolution
+is fail-closed before any job starts. Raw values are kept in memory for `needs`
 context; every persisted/printed surface is redacted. `SecretValue` has a masked
-`Debug`. The file provider uses a lock, atomic replace and restrictive
-permissions where the platform supports them.
+`Debug`. The file provider uses a lock, atomic replace, restrictive Unix modes,
+and on Windows removes inherited ACLs with `icacls /inheritance:r`.
 
 ## Architecture decisions
 
@@ -87,9 +89,11 @@ permissions where the platform supports them.
 
 - The storage layer is a single mutex; acceptable for a local CLI, but a
   long-running daemon with many concurrent commands can contend.
-- `pipeline plan` still performs project detection on every call. Warm planning
-  of 48 jobs is ~71 ms; cold planning is dominated by toolchain probes.
-- A crash leaves concurrency slots until the 1 h lease expires. Normal runs
-  release all slots they hold.
+- `pipeline plan` still performs project detection on every call. Final warm
+  planning of 48 jobs measured 104.57 ms [100.69, 109.02]; the stored earlier
+  baseline was 71.31 ms. Cold planning is dominated by toolchain probes.
+- A crashed owner holds a slot until its 60 s lease expires; heartbeat renewal
+  prevents a live owner from losing it. Normal runs release all held slots.
 - Workspace isolation is per-job, not an OS sandbox. Untrusted actions can read
-  the host filesystem; see the threat model.
+  the host filesystem; `security.mode: isolated` fails closed when no verified
+  backend exists. See the threat model.

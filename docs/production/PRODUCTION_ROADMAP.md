@@ -64,21 +64,22 @@ Remaining: `tracing` spans, metrics endpoint, log rotation.
 
 - Criterion benchmarks for parse, compile and plan.
 - Toolchain facts cache and per-target capability cache.
-- Warm 48-job plan: ~71 ms; cold: ~4.5 s on this host.
+- Final warm 48-job plan: 104.57 ms [100.69, 109.02]; historical baseline 71.31 ms. Cold planning was not re-measured (~4.5 s historically).
 
 ## Phase 8 - Release engineering (pipeline added, not executed here)
 
 - `ci.yml`: fmt, clippy, tests and release build on three OSes.
 - `release.yml`: gates, archive, SHA256SUMS, CycloneDX SBOM, signing hook.
-- Deterministic `scripts/sbom.py`.
+- Deterministic `scripts/sbom.py` and `scripts/manifest.py` (archive hash, size, commit, SBOM, smoke status, `UNSIGNED`).
+- Local Windows x64 archive verified, smoke-tested and byte-identical on re-packaging.
 
 Blocked: GitHub Actions run, signing identity, published artifacts.
 
-## Phase 9 - Final verification
+## Phase 9 - Final verification (complete)
 
-- Run all four gates and full JSON contract checks.
-- Record actual test and benchmark output.
-- State the verdict and every blocked gate.
+- Four gates run: fmt, clippy, 172 tests, release build.
+- Actual output in `READINESS_EVIDENCE.md`, `RELEASE_VERIFICATION.md` and `target/`.
+- Scoped verdicts and blocked gates in `READINESS_GATES.json` and `FINAL_READINESS_REPORT.md`.
 
 ## Definition of done
 

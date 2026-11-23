@@ -62,7 +62,8 @@ python scripts/sbom.py > dist/sbom.cdx.json
 # 4. Extract the archive and run smoke tests before writing the manifest.
 #    Record the exact commands and exit codes.
 python scripts/manifest.py --version 0.1.0 --dir dist \
-  --smoke-status passed --smoke-command "ubuilder.exe --version"
+  --smoke-status passed \
+  --smoke-command "ubuilder.exe --version; ubuilder.exe --json doctor --all; ubuilder.exe target list --json"
 
 # 5. Checksums last: SHA256SUMS covers archives, SBOM and manifest.
 python scripts/checksums.py dist

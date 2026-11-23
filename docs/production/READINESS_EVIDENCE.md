@@ -25,9 +25,9 @@ in `READINESS_GATES.json`; the documentation commit follows it.
 | Gate | Command | Result | Evidence |
 | --- | --- | --- | --- |
 | Format | `cargo fmt --all -- --check` | exit 0 | terminal |
-| Clippy | `cargo clippy --all-targets --locked -- -D warnings` | exit 0 | `target/finalization-clippy.log` |
+| Clippy | `cargo clippy --all-targets --locked -- -D warnings` | exit 0 | `target/finalization-clippy-final.log` |
 | Tests | `cargo test --all-targets --locked` | 172 passed, 0 failed, exit 0 | `target/finalization-final.log` |
-| Release build | `cargo build --release --locked` | exit 0 | terminal |
+| Release build | `cargo build --release --locked` | exit 0 | `target/finalization-release-build.log` |
 
 ### Test counts
 

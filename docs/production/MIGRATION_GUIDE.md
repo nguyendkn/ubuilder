@@ -2,9 +2,10 @@
 
 ## Database schema
 
-Current schema version: **1**. `schema_migrations` stores `(version, applied_at)`.
+Current schema version: **2**. `schema_migrations` stores `(version, applied_at)`.
 Schema creation is idempotent (`CREATE TABLE IF NOT EXISTS`) and all additive
-tables use `IF NOT EXISTS`.
+tables use `IF NOT EXISTS`. Migrating a non-empty v1 database writes a
+`VACUUM INTO` backup before DDL runs inside `BEGIN IMMEDIATE`.
 
 Upgrade procedure:
 
@@ -14,9 +15,9 @@ Upgrade procedure:
 4. Run `ubuilder maintenance stats --json` and `ubuilder pipeline history --limit 1`.
 5. Run one small workflow and verify status/logs.
 
-Downgrade: version 1 is the only schema. A newer binary may add tables or
-columns; the current reader does not reject a higher `schema_migrations`
-version. Restore the backup taken before upgrade if the old binary misbehaves.
+Downgrade: a binary that opens a database with a higher schema version fails
+with `SCHEMA_UNSUPPORTED` (exit 3) before running DDL. Use a matching binary or
+restore the automatic pre-migration backup if an older binary must read it.
 
 ## State spelling compatibility
 
@@ -36,8 +37,9 @@ continue to use the persisted spellings.
 
 ## Cache changes
 
-- Pipeline cache keys are step-scoped and host-specific:
-  `sha256("pipeline/v1/<host>\n<user-key>")`.
+- Pipeline cache keys are layered:
+  `sha256("pipeline/<namespace>/v1/<host>/<toolchain>\n<user-key>")`, where the
+  namespace includes the workflow name and file name.
 - The workflow digest is intentionally excluded. If a step's output depends on
   a toolchain or global input, that input must be part of the step key.
 - Old keys that included the workflow digest are not read; the first run after
@@ -67,8 +69,10 @@ stored in shell history.
 ## Concurrency
 
 Legacy `pipeline_locks` rows are not read by the new bounded-slot scheduler.
-Expired slots are cleaned on acquisition. If an old run left a group blocked,
-wait for the lease or delete its slot rows after confirming no process is alive.
+Slots carry a generation fencing token and a 60 s lease; live owners renew every
+15 s. Expired slots are cleaned on acquisition, and an expired owner can no
+longer renew or release. If an old run left a group blocked, wait for the lease
+or delete its slot rows after confirming no process is alive.
 
 ## CLI and JSON
 

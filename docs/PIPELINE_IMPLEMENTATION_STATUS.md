@@ -9,14 +9,16 @@ default shell, native target `windows-x64`.
 
 | Suite | Tests | Coverage |
 | --- | ---: | --- |
-| Library unit tests | 100 | parser, validator, compiler, matrix, expressions, planner, artifacts, cache, storage, state machine, executor |
-| `tests/builds.rs` | 1 | real Rust build, packaging, validation, manifest |
+| Library unit tests | 123 | parser, validator, compiler, matrix, expressions, planner, artifacts, cache, storage, schema, state machine, executor, secrets, isolation |
+| `tests/builds.rs` | 2 | real Rust and .NET builds, packaging, validation, manifest, executable smoke test |
 | `tests/cli.rs` | 6 | legacy CLI, detection, project reporting |
-| `tests/compatibility.rs` | 2 | target compatibility matrix |
+| `tests/compatibility.rs` | 3 | target compatibility matrix and `doctor --all` ordering |
+| `tests/daemon.rs` | 4 | lifecycle, stale pid, webhook auth/limits/replay, token environment |
 | `tests/pipeline_contract.rs` | 7 | validation, diagnostics, matrix plan, graph formats, cycles, init/list |
-| `tests/pipeline_runtime.rs` | 23 | full runs, artifacts, cache, fail-fast, parallelism, timeout, cancellation, retry, continue-on-error, outputs, recovery, secrets, concurrency slots, retention/pinning/GC, daemon once mode |
+| `tests/pipeline_runtime.rs` | 27 | full runs, artifacts, cache, fail-fast, parallelism, timeout, cancellation, retry, continue-on-error, outputs, recovery, secrets, concurrency slots, isolation fail-closed, retention/pinning/GC, daemon once mode |
+| **Total** | **172** | all passing on Windows x64 |
 
-`cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`
+`cargo fmt --all -- --check` and `cargo clippy --all-targets --locked -- -D warnings`
 also pass. Criterion benchmarks live in `benches/pipeline.rs`.
 
 ## Implemented and exercised
@@ -33,15 +35,15 @@ also pass. Criterion benchmarks live in `benches/pipeline.rs`.
 | Action stdout capture | Tested | message stored as output and step log |
 | Local artifact store | Tested | content-addressed upload + download + integrity verification |
 | Pipeline cache | Tested | miss/hit, unrelated-edit survival, corruption detection |
-| Fail-fast matrix siblings | Tested | sibling skipped, parallelism preserved |
-| Parallel independent jobs | Tested | two 2 s jobs complete under 4 s of run time |
+| Fail-fast matrix siblings | Tested | queued sibling skipped, running sibling not serialized (marker intervals) |
+| Parallel independent jobs | Tested | marker intervals prove overlap, not wall-clock duration |
 | Step timeout and process-tree kill | Tested | 1 s timeout on a 10 s sleep |
 | Cross-process cancellation | Tested | `pipeline cancel`, exit 130, `cancelled` status |
 | Retry policy | Tested | fail-then-succeed across attempts |
 | `continue-on-error` | Tested | status `failure`, conclusion `success` |
 | Job outputs / `needs` context | Tested | produced value consumed by dependent job |
-| Concurrency groups | Tested | bounded slots; serialization without deadlock |
-| `cancel-in-progress` | Implemented | peers receive a cancel marker; not covered by a dedicated test |
+| Concurrency groups | Tested | fenced 60 s lease + heartbeat; serialization and peer cancellation tested |
+| `cancel-in-progress` | Tested | holder releases its lease; marker serialization proven |
 | Typed lifecycle | Tested | transition table + transactional rejection (`STATE_INVALID`) |
 | SQLite persistence | Tested | status/history/logs, transitions, retention |
 | Secret providers and redaction | Tested | fail-closed resolution, CLI masking, report redaction |
@@ -49,7 +51,7 @@ also pass. Criterion benchmarks live in `benches/pipeline.rs`.
 | Stale run recovery | Tested | killed process recovered to `failed` |
 | JSON envelopes and exit codes | Tested | 1 / 2 / 3 / 130 cases |
 | Mermaid / DOT / JSON graph | Tested | contract test |
-| Trigger daemon | Partial | git/workflow fingerprint + loopback webhook + once mode |
+| Trigger daemon | Tested | lifecycle, git/workflow fingerprint, authenticated loopback webhook, once mode |
 | Production example workflows | Tested | validate + plan + real run on Windows |
 
 ## Partial / untested
@@ -60,11 +62,10 @@ also pass. Criterion benchmarks live in `benches/pipeline.rs`.
 | macOS targets | Untested | No host/SDK; CI includes macOS |
 | Cross-compilation | Untested | Target installed but linker unverified |
 | `container` / `wsl` backends | Not implemented | Planner rejects them with a remediation |
-| Daemon detached start/stop/webhook | Not integration-tested | Once mode is tested; loopback HTTP and PID lifecycle are code-verified only |
-| `cancel-in-progress` | Implemented, untested | Uses the cross-process cancel marker |
-| OS sandbox | Not implemented | Jobs share the invoking user's filesystem permissions |
+| Daemon detached start/stop/webhook | Tested | Lifecycle, stale pid, auth, limits and replay are integration-tested on Windows |
+| OS sandbox | Fail-closed only | No verified backend; `isolated` returns exit 3 without running natively |
 | Dependency audit | Not run | `cargo-audit`/`cargo-deny` absent; SBOM generated |
-| Signing / notarization | Hook only | No credentials |
+| Signing / notarization | Hook only | No credentials; archive is `UNSIGNED` |
 | Remote action marketplace | Not implemented | Only compiled-in `builtin/*` actions |
 | Artifact compression/dedup | Content-addressed only | Identical content reuses one object; no compression |
 
@@ -74,9 +75,9 @@ also pass. Criterion benchmarks live in `benches/pipeline.rs`.
 - Cache keys are step-scoped; callers must include toolchain inputs.
 - Job-level timeout is enforced around the whole body; a process that ignores
   termination may delay the report.
-- A crashed run can hold a concurrency slot until its 1 h lease expires.
-- Planning is ~71 ms warm for 48 jobs and ~4.5 s cold due to toolchain probes.
-- Schema creation is idempotent but a newer schema version is not rejected.
+- A crashed run can hold a concurrency slot until its 60 s lease expires; live owners renew every 15 s.
+- Planning measured 104.57 ms warm for 48 jobs in the final run (earlier baseline 71.31 ms); cold planning was not re-measured.
+- A newer schema version is rejected with `SCHEMA_UNSUPPORTED` before DDL; migration backs up with `VACUUM INTO`.
 - Logs and workspaces are not encrypted; retention is explicit.
 
 See `docs/production/` for the audit, threat model, risk register, performance

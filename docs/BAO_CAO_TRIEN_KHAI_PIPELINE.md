@@ -22,7 +22,7 @@ Các kết quả chính:
 - Secret provider env/file, resolve fail-closed một lần mỗi run, redaction trên report/log/error/JSON.
 - Cache theo step, artifact được băm lại và xác minh; retention có `stats/prune/gc/pin/unpin`.
 - Action step lưu `stdout_tail` và log; daemon hỗ trợ polling, webhook loopback và chế độ `--once`.
-- **139 bài kiểm thử đều đạt**; `cargo fmt`, `cargo clippy -D warnings` và `cargo build --release` sạch.
+- **172 bài kiểm thử đều đạt**; `cargo fmt`, `cargo clippy --all-targets --locked -D warnings` và `cargo build --release --locked` sạch.
 - Tài liệu kiến trúc, DSL, IR, runtime, bảo mật, actions, vận hành, phát hành và bộ `docs/production/` đã được viết.
 - CI cho Windows, Ubuntu và macOS; release workflow tạo archive, checksum và SBOM CycloneDX.
 - Mã nguồn đã được commit sạch trong Git tại `dc3de80`.
@@ -192,7 +192,7 @@ Compiler gọi `Target::parse("native")` và trả `UNSUPPORTED_TARGET`. Nay com
 | Retention | `maintenance stats/prune/gc/pin/unpin`; giữ run terminal mới nhất, bỏ qua run đang chạy, bảo vệ artifact được pin | `maintenance_prune_keeps_newest_runs_and_protects_active`, `maintenance_pin_protects_and_gc_removes_unreferenced_objects` |
 | Action output | `run_step_once` nhận log dir thật; lưu `stdout_tail` đã redact và `log_path` | `action_steps_capture_message_output` |
 | Hiệu năng | Cache facts toolchain 30 giây; planner cache capability theo target; thêm Criterion benchmark | `benches/pipeline.rs` |
-| Daemon | `daemon start/stop/status/run/trigger`; polling fingerprint, webhook loopback POST kèm token tùy chọn, chế độ `--once` | `daemon_once_runs_the_workflow_and_records_state`; kiểm tra thủ công webhook 401/405/202 |
+| Daemon | `daemon start/stop/status/run/trigger`; polling fingerprint, webhook loopback POST bắt buộc token, chế độ `--once` | `daemon_once_runs_the_workflow_and_records_state`; kiểm tra thủ công webhook 401/405/202 |
 | Release | CI 3 hệ điều hành; release workflow tạo archive, checksum, SBOM, hook ký tùy chọn | `dist/` cục bộ đã verify |
 
 **Secrets.** Tên secret được trích từ IR và resolve đúng một lần trước job đầu tiên; thiếu tên nào thì run fail-closed. Giá trị thô chỉ nằm trong bộ nhớ để phục vụ `needs.*.outputs`; mọi bề mặt serialize đều dùng `***`. `secret set --value` vẫn lộ giá trị trong argv, nên khuyến nghị `--stdin` hoặc prompt.
@@ -334,21 +334,22 @@ Giới hạn tài nguyên:
 | Lệnh | Kết quả |
 | --- | --- |
 | `cargo fmt --all -- --check` | Đạt |
-| `cargo clippy --all-targets -- -D warnings` | Đạt, không cảnh báo |
-| `cargo test --all-targets --locked` | **139/139 đạt**, 102,34 giây |
+| `cargo clippy --all-targets --locked -- -D warnings` | Đạt, không cảnh báo |
+| `cargo test --all-targets --locked` | **172/172 đạt**, 0 thất bại |
 | `cargo build --release --locked` | Đạt |
 
 ### 5.2 Phân bố kiểm thử
 
 | Bộ kiểm thử | Số bài | Kết quả |
 | --- | ---: | --- |
-| Unit test thư viện | 100 | Đạt |
-| `tests/builds.rs` | 1 | Đạt |
+| Unit test thư viện | 123 | Đạt |
+| `tests/builds.rs` | 2 | Đạt |
 | `tests/cli.rs` | 6 | Đạt |
-| `tests/compatibility.rs` | 2 | Đạt |
+| `tests/compatibility.rs` | 3 | Đạt |
+| `tests/daemon.rs` | 4 | Đạt |
 | `tests/pipeline_contract.rs` | 7 | Đạt |
-| `tests/pipeline_runtime.rs` | 23 | Đạt |
-| **Tổng** | **139** | **Đạt** |
+| `tests/pipeline_runtime.rs` | 27 | Đạt |
+| **Tổng** | **172** | **Đạt** |
 
 ### 5.3 Benchmark
 
@@ -356,12 +357,12 @@ Giới hạn tài nguyên:
 
 | Benchmark | Kết quả |
 | --- | ---: |
-| Parse + validate | 234,69 µs |
-| Compile + expand | 403,61 µs |
-| Plan 48 job, warm | 71,31 ms |
-| Plan 48 job, cold | khoảng 4,5 s |
+| Parse + validate | 271,88 µs [261,81; 282,45] |
+| Compile + expand | 477,68 µs [460,59; 494,62] |
+| Plan 48 job, warm | 104,57 ms [100,69; 109,02] |
+| Plan 48 job, cold | chưa đo lại; baseline cũ khoảng 4,5 s |
 
-Cold plan chậm do probe toolchain; facts được cache 30 giây trong cùng tiến trình.
+Cold plan chậm do probe toolchain; facts được cache 30 giây trong cùng tiến trình. So với baseline, parse +15,8%, compile +18,3%, warm plan +46,6%; regression warm plan được công bố, không che giấu (xem `docs/production/PERFORMANCE_BASELINE.md`).
 
 ### 5.4 Kiểm chứng thủ công
 
@@ -378,8 +379,8 @@ Artifact phát hành cục bộ:
 
 | Tệp | Kích thước | SHA-256 |
 | --- | ---: | --- |
-| `ubuilder-windows-x64.zip` | 3,6 MiB | `7b18aca911391849b3de0035ee1173be76b9ceab14d3972fdbc81c9eb911b65a` |
-| `sbom.cdx.json` | 98 KiB | `b3ba576aec19310f886f956aa51233accf809044044f5de977d533e5ead0cea2` |
+| `ubuilder-windows-x64.zip` | 3.805.328 B | `b63a6e45c3463c10ed6739f3b0fb3557601041cfe3eaae29c015549c5cd75864` |
+| `sbom.cdx.json` | 99.857 B | `b3ba576aec19310f886f956aa51233accf809044044f5de977d533e5ead0cea2` |
 
 Archive có 24 entry và chứa `ubuilder.exe`. SBOM là CycloneDX 1.5 với 168 component và 168 dependency node. `dist/` được ignore, không commit.
 
@@ -387,7 +388,7 @@ Archive có 24 entry và chứa `ubuilder.exe`. SBOM là CycloneDX 1.5 với 168
 
 | Nền tảng | Build | Test | Fixture native | Bằng chứng |
 | --- | --- | --- | --- | --- |
-| Windows x64 | Đạt | 139/139 | Đạt | Máy hiện tại |
+| Windows x64 | Đạt | 172/172 | Đạt | Máy hiện tại |
 | Linux x64 | **Chưa xác minh** | CI đã cấu hình | Chưa chạy | Cross build thiếu `x86_64-linux-gnu-gcc` |
 | macOS | **Chưa xác minh** | CI đã cấu hình | Chưa chạy | Không có host/SDK; CI chưa chạy thực tế |
 
@@ -407,14 +408,14 @@ Không có binary Linux hoặc macOS nào được tuyên bố trong báo cáo n
 | Chặn symlink thoát khỏi root | `copy_tree_rejects_symlinks_escaping_the_root` (`cfg(unix)`) |
 | Run terminal không quay lại `running` | `storage::tests::terminal_run_state_cannot_transition_back_to_running` |
 | Retention không xóa run active hoặc artifact được pin | Hai integration test maintenance |
-| Webhook chỉ loopback, POST, token tùy chọn | Kiểm tra thủ công `401` / `405` / `202` |
+| Webhook chỉ loopback, POST, token bắt buộc, rate/replay limit | Test tự động `401` / `405` / `409` / `429` / `202` |
 
 Residual findings:
 
 - Workspace là ranh giới thư mục, không phải OS sandbox; workflow tin cậy chạy với quyền người dùng.
-- File secret trên Windows dựa vào ACL kế thừa; trên Unix được đặt `0600` và thư mục `0700`.
+- File secret trên Windows dùng `icacls /inheritance:r` và từ chối reparse point; trên Unix được đặt `0600` và thư mục `0700`.
 - `secret set --value` lộ giá trị trong argv; dùng `--stdin` hoặc prompt.
-- Webhook không có TLS, rate limit hoặc replay window; chỉ dùng loopback.
+- Webhook bắt buộc token, giới hạn 16 KiB header / 64 KiB body / 60 request mỗi 60 giây, replay cache 1024 mục; transport vẫn là HTTP loopback không TLS và cache replay không bền qua restart.
 - Chưa chạy `cargo-audit` / `cargo-deny`; SBOM là inventory, không phải vulnerability scan.
 - Chưa có code signing, macOS notarization hoặc release công khai.
 
@@ -475,7 +476,7 @@ Tầng pipeline đã đạt mục tiêu: khai báo bằng YAML, thực thi cục
 
 Trên Windows x64, các gate đã chạy thật:
 
-- 139/139 bài kiểm thử đạt.
+- 172/172 bài kiểm thử đạt.
 - `fmt`, `clippy -D warnings`, `build --release` đạt.
 - Benchmark có số đo cụ thể; release artifact và checksum đã được xác minh.
 
