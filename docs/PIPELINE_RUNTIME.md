@@ -54,10 +54,10 @@ and step env.
 - Jobs within a wave run concurrently.
 - Matrix siblings share a semaphore keyed by `base_id`.
   - `max-parallel` sets the limit.
-  - With `fail-fast: true` and no explicit limit, the limit is **1**, making
-    failure order deterministic and allowing remaining siblings to be skipped.
-  - With `max-parallel > 1`, already-running siblings are not cancelled; only
-    siblings that have not started become `skipped`.
+  - The default limit is host parallelism (at least 2); fail-fast does not
+    serialize the matrix.
+  - With `fail-fast: true`, already-running siblings are not cancelled; only
+    siblings that have not acquired a permit become `skipped` after a failure.
 - `--job <id>` selects a base job or instance plus all transitive dependencies.
 - A cancelled run stops scheduling further waves.
 

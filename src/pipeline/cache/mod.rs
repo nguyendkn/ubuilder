@@ -11,15 +11,13 @@ pub const CACHE_ACTION_VERSION: &str = "v1";
 pub struct PipelineCache {
     cache: Cache,
     host: String,
-    workflow_digest: String,
 }
 
 impl PipelineCache {
-    pub fn open(root: &Path, enabled: bool, host: &str, ir: &WorkflowIr) -> Result<Self> {
+    pub fn open(root: &Path, enabled: bool, host: &str, _ir: &WorkflowIr) -> Result<Self> {
         Ok(Self {
             cache: Cache::open(root, enabled)?,
             host: host.into(),
-            workflow_digest: ir.source_digest.clone(),
         })
     }
 
@@ -30,10 +28,11 @@ impl PipelineCache {
     /// Namespaced, host-specific key. The key itself is hashed so arbitrary
     /// user text never becomes a path.
     pub fn key(&self, user_key: &str) -> String {
-        let prefix = format!(
-            "pipeline/{}/{}/{}",
-            CACHE_ACTION_VERSION, self.host, self.workflow_digest
-        );
+        // The user key is the step-level fingerprint. Workflow-wide fields are
+        // deliberately excluded: editing an unrelated job must not evict this
+        // step's cache. The key contract still requires callers to include
+        // toolchain/version inputs that affect the restored directory.
+        let prefix = format!("pipeline/{}/{}", CACHE_ACTION_VERSION, self.host);
         crate::artifacts::sha256_bytes(format!("{prefix}\n{user_key}").as_bytes())
     }
 

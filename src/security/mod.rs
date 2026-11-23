@@ -98,7 +98,7 @@ pub fn looks_secret_key(key: &str) -> bool {
 pub fn redact(text: &str, secrets: &[String]) -> String {
     let mut out = text.to_string();
     for secret in secrets {
-        if secret.len() >= 4 {
+        if !secret.is_empty() {
             out = out.replace(secret, "***");
         }
     }

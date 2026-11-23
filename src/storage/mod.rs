@@ -4,6 +4,7 @@
 //! state transitions that matter (finishing a job) run inside a transaction.
 
 use crate::error::{ErrorCode, Result, UbuilderError};
+use crate::pipeline::state::{validate_transition, RunState, StateEntity};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -281,9 +282,31 @@ impl Db {
                 owner TEXT NOT NULL,
                 lease_until INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS pipeline_concurrency_slots (
+                group_name TEXT NOT NULL,
+                slot INTEGER NOT NULL,
+                owner TEXT NOT NULL,
+                lease_until INTEGER NOT NULL,
+                PRIMARY KEY (group_name, slot)
+            );
+            CREATE INDEX IF NOT EXISTS idx_concurrency_owner
+                ON pipeline_concurrency_slots (group_name, owner);
+            CREATE TABLE IF NOT EXISTS artifact_pins (
+                sha256 TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            );
             "#,
         )
         .map_err(|e| db_error("migrate schema", e))?;
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?1)",
+            params![crate::telemetry::now_ms() as i64],
+        );
         Ok(())
     }
 
@@ -599,13 +622,122 @@ impl Db {
         error: Option<&str>,
         finished_at: Option<u128>,
     ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| db_error("begin run transition", e))?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT status FROM pipeline_runs WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| db_error("read run state", e))?;
+        let to = RunState::parse(status).ok_or_else(|| {
+            UbuilderError::new(
+                ErrorCode::StateInvalid,
+                format!("unknown run state '{status}'"),
+            )
+        })?;
+        if let Some(current) = current {
+            validate_transition(StateEntity::Run, &current, to)?;
+        }
+        tx.execute(
             "UPDATE pipeline_runs SET status=?1, error=COALESCE(?2, error), finished_at=COALESCE(?3, finished_at) WHERE id=?4",
             params![status, error, finished_at.map(|v| v as i64), id],
         )
         .map_err(|e| db_error("update pipeline run", e))?;
+        tx.commit()
+            .map_err(|e| db_error("commit run transition", e))?;
         Ok(())
+    }
+
+    pub fn all_pipeline_runs(&self) -> Result<Vec<PipelineRunRecord>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, workflow, source_path, source_digest, status, created_at, started_at, finished_at, host, inputs_json, error FROM pipeline_runs ORDER BY created_at DESC",
+            )
+            .map_err(|e| db_error("prepare all pipeline runs", e))?;
+        let rows = stmt
+            .query_map([], pipeline_run_row)
+            .map_err(|e| db_error("query all pipeline runs", e))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| db_error("read all pipeline runs", e))
+    }
+
+    /// Delete one run and its jobs, steps and artifact references atomically.
+    pub fn delete_pipeline_run(&self, id: &str) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| db_error("begin run deletion", e))?;
+        tx.execute("DELETE FROM pipeline_steps WHERE run_id=?1", params![id])
+            .map_err(|e| db_error("delete run steps", e))?;
+        tx.execute("DELETE FROM pipeline_jobs WHERE run_id=?1", params![id])
+            .map_err(|e| db_error("delete run jobs", e))?;
+        tx.execute(
+            "DELETE FROM pipeline_artifacts WHERE run_id=?1",
+            params![id],
+        )
+        .map_err(|e| db_error("delete run artifacts", e))?;
+        let removed = tx
+            .execute("DELETE FROM pipeline_runs WHERE id=?1", params![id])
+            .map_err(|e| db_error("delete run", e))?;
+        tx.commit()
+            .map_err(|e| db_error("commit run deletion", e))?;
+        Ok(removed > 0)
+    }
+
+    /// Map object SHA-256 to (reference count, bytes) across retained artifacts.
+    pub fn pipeline_artifact_references(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, (u64, u64)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT sha256, COUNT(*), MAX(size) FROM pipeline_artifacts GROUP BY sha256")
+            .map_err(|e| db_error("prepare artifact references", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u64),
+                ))
+            })
+            .map_err(|e| db_error("query artifact references", e))?;
+        rows.collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()
+            .map_err(|e| db_error("read artifact references", e))
+    }
+
+    pub fn pin_artifact(&self, sha256: &str, name: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO artifact_pins (sha256, name, created_at) VALUES (?1, ?2, ?3)",
+            params![sha256, name, crate::telemetry::now_ms() as i64],
+        )
+        .map_err(|e| db_error("pin artifact", e))?;
+        Ok(())
+    }
+
+    pub fn unpin_artifact(&self, sha256: &str) -> Result<bool> {
+        let conn = self.lock();
+        let removed = conn
+            .execute("DELETE FROM artifact_pins WHERE sha256=?1", params![sha256])
+            .map_err(|e| db_error("unpin artifact", e))?;
+        Ok(removed > 0)
+    }
+
+    pub fn pinned_artifacts(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT sha256, name FROM artifact_pins ORDER BY created_at")
+            .map_err(|e| db_error("prepare pins", e))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| db_error("query pins", e))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| db_error("read pins", e))
     }
 
     pub fn pipeline_run(&self, id: &str) -> Result<Option<PipelineRunRecord>> {
@@ -661,8 +793,28 @@ impl Db {
     }
 
     pub fn upsert_pipeline_job(&self, job: &PipelineJobRecord) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| db_error("begin job transition", e))?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT status FROM pipeline_jobs WHERE run_id=?1 AND id=?2",
+                params![job.run_id, job.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| db_error("read job state", e))?;
+        let to = RunState::parse(&job.status).ok_or_else(|| {
+            UbuilderError::new(
+                ErrorCode::StateInvalid,
+                format!("unknown job state '{}'", job.status),
+            )
+        })?;
+        if let Some(current) = current {
+            validate_transition(StateEntity::Job, &current, to)?;
+        }
+        tx.execute(
             r#"INSERT INTO pipeline_jobs
                (run_id, id, base_id, name, matrix_json, status, conclusion, started_at, finished_at, error, outputs_json)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -684,6 +836,8 @@ impl Db {
             ],
         )
         .map_err(|e| db_error("upsert pipeline job", e))?;
+        tx.commit()
+            .map_err(|e| db_error("commit job transition", e))?;
         Ok(())
     }
 
@@ -716,8 +870,28 @@ impl Db {
     }
 
     pub fn upsert_pipeline_step(&self, step: &PipelineStepRecord) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| db_error("begin step transition", e))?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT status FROM pipeline_steps WHERE run_id=?1 AND job_id=?2 AND step_id=?3",
+                params![step.run_id, step.job_id, step.step_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| db_error("read step state", e))?;
+        let to = RunState::parse(&step.status).ok_or_else(|| {
+            UbuilderError::new(
+                ErrorCode::StateInvalid,
+                format!("unknown step state '{}'", step.status),
+            )
+        })?;
+        if let Some(current) = current {
+            validate_transition(StateEntity::Step, &current, to)?;
+        }
+        tx.execute(
             r#"INSERT INTO pipeline_steps
                (run_id, job_id, step_id, name, status, conclusion, exit_code, started_at, finished_at, log_path, error)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -740,6 +914,8 @@ impl Db {
             ],
         )
         .map_err(|e| db_error("upsert pipeline step", e))?;
+        tx.commit()
+            .map_err(|e| db_error("commit step transition", e))?;
         Ok(())
     }
 
@@ -834,6 +1010,100 @@ impl Db {
             )
             .map_err(|e| db_error("acquire pipeline lock", e))?;
         Ok(changed > 0)
+    }
+
+    /// Acquire one of `max` slots in a group. Returns the slot number.
+    pub fn acquire_concurrency_slot(
+        &self,
+        group: &str,
+        owner: &str,
+        max: usize,
+        now: u128,
+        lease_ms: u128,
+    ) -> Result<Option<i64>> {
+        let mut conn = self.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| db_error("begin concurrency slot", e))?;
+        tx.execute(
+            "DELETE FROM pipeline_concurrency_slots WHERE group_name=?1 AND lease_until < ?2",
+            params![group, now as i64],
+        )
+        .map_err(|e| db_error("expire concurrency slots", e))?;
+        let own: Option<i64> = tx
+            .query_row(
+                "SELECT slot FROM pipeline_concurrency_slots WHERE group_name=?1 AND owner=?2 LIMIT 1",
+                params![group, owner],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| db_error("read own concurrency slot", e))?;
+        if let Some(slot) = own {
+            tx.execute(
+                "UPDATE pipeline_concurrency_slots SET lease_until=?1 WHERE group_name=?2 AND slot=?3",
+                params![(now + lease_ms) as i64, group, slot],
+            )
+            .map_err(|e| db_error("renew concurrency slot", e))?;
+            tx.commit()
+                .map_err(|e| db_error("commit concurrency slot", e))?;
+            return Ok(Some(slot));
+        }
+        let used: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM pipeline_concurrency_slots WHERE group_name=?1",
+                params![group],
+                |row| row.get(0),
+            )
+            .map_err(|e| db_error("count concurrency slots", e))?;
+        if used as usize >= max.max(1) {
+            return Ok(None);
+        }
+        let mut slot = 0i64;
+        while tx
+            .query_row(
+                "SELECT 1 FROM pipeline_concurrency_slots WHERE group_name=?1 AND slot=?2",
+                params![group, slot],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| db_error("find concurrency slot", e))?
+            .is_some()
+        {
+            slot += 1;
+        }
+        tx.execute(
+            "INSERT INTO pipeline_concurrency_slots (group_name, slot, owner, lease_until) VALUES (?1, ?2, ?3, ?4)",
+            params![group, slot, owner, (now + lease_ms) as i64],
+        )
+        .map_err(|e| db_error("insert concurrency slot", e))?;
+        tx.commit()
+            .map_err(|e| db_error("commit concurrency slot", e))?;
+        Ok(Some(slot))
+    }
+
+    pub fn release_concurrency_slot(&self, group: &str, owner: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM pipeline_concurrency_slots WHERE group_name=?1 AND owner=?2",
+            params![group, owner],
+        )
+        .map_err(|e| db_error("release concurrency slot", e))?;
+        Ok(())
+    }
+
+    /// Owners currently holding slots in a group.
+    pub fn concurrency_owners(&self, group: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT owner FROM pipeline_concurrency_slots WHERE group_name=?1 ORDER BY slot",
+            )
+            .map_err(|e| db_error("prepare concurrency owners", e))?;
+        let rows = stmt
+            .query_map(params![group], |row| row.get(0))
+            .map_err(|e| db_error("query concurrency owners", e))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| db_error("read concurrency owners", e))
     }
 
     pub fn release_pipeline_lock(&self, group: &str, owner: &str) -> Result<()> {
@@ -958,6 +1228,31 @@ mod tests {
         })
         .unwrap();
         assert_eq!(db.list_artifacts(Some("windows-x64")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn terminal_run_state_cannot_transition_back_to_running() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_pipeline_run(&PipelineRunRecord {
+            id: "run1".into(),
+            workflow: "ci".into(),
+            source_path: PathBuf::from("ci.yml"),
+            source_digest: "digest".into(),
+            status: "running".into(),
+            created_at: 1,
+            started_at: Some(1),
+            finished_at: None,
+            host: "windows-x64".into(),
+            inputs_json: "{}".into(),
+            error: None,
+        })
+        .unwrap();
+        db.update_pipeline_run("run1", "success", None, Some(2))
+            .unwrap();
+        let error = db
+            .update_pipeline_run("run1", "running", None, None)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::StateInvalid, "{error}");
     }
 
     #[test]

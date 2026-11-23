@@ -136,9 +136,11 @@ strategy:
 - Limit: 256 combinations. Duplicate combinations are errors.
 - Job ids become `build[target=windows-x64,profile=release]`.
 - `${{ matrix.<axis> }}` is available in steps.
-- With `fail-fast: true` and no `max-parallel`, siblings run one at a time so a
-  failure deterministically skips the remaining siblings. Setting
-  `max-parallel` allows concurrency; already-running siblings are not cancelled.
+- With `fail-fast: true`, a failure stops new siblings from being scheduled:
+  siblings that have not acquired a concurrency permit become `skipped`.
+  Already-running siblings are allowed to finish. `max-parallel` controls the
+  limit; when absent it defaults to host parallelism, never to 1 (fail-fast
+  does not serialize the matrix).
 
 ## Steps
 
@@ -190,7 +192,7 @@ Available roots:
 | `env` | current job/step environment |
 | `runner` | `os`, `arch`, `native`, `backend` |
 | `workspace` | absolute job workspace (inside run-code contexts) |
-| `secrets` | empty map; secrets are not read from files |
+| `secrets` | names referenced by the workflow and resolved before the run |
 
 Unknown roots, unknown functions and malformed syntax fail validation with the
 field and location. Expressions never invoke a shell or an interpreter.

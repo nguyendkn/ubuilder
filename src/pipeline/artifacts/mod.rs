@@ -67,10 +67,12 @@ impl ArtifactStore {
         let tree = object.join("tree");
         let manifest_path = object.join("manifest.json");
         if !manifest_path.is_file() {
-            let staging = self
-                .root
-                .join("tmp")
-                .join(format!("{}-{}", sha256, std::process::id()));
+            let staging = self.root.join("tmp").join(format!(
+                "{}-{}-{}",
+                sha256,
+                std::process::id(),
+                crate::telemetry::now_ms()
+            ));
             let _ = std::fs::remove_dir_all(&staging);
             std::fs::create_dir_all(staging.join("tree"))
                 .map_err(|e| UbuilderError::io("cannot create artifact staging", e))?;
@@ -88,6 +90,14 @@ impl ArtifactStore {
                 })?;
             }
             let size = tree_size(&payload)?;
+            let copied_hash = hash_path(&payload)?;
+            if copied_hash != sha256 {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(UbuilderError::new(
+                    ErrorCode::ArtifactInvalid,
+                    format!("artifact copy changed content for {}", source.display()),
+                ));
+            }
             let manifest = ObjectManifest {
                 kind: kind.into(),
                 root_name,
@@ -100,11 +110,18 @@ impl ArtifactStore {
                     .map_err(|e| UbuilderError::new(ErrorCode::Internal, e.to_string()))?,
             )
             .map_err(|e| UbuilderError::io("cannot write artifact manifest", e))?;
-            let _ = std::fs::remove_dir_all(&object);
-            std::fs::rename(&staging, &object)
-                .map_err(|e| UbuilderError::io("cannot publish artifact object", e))?;
+            // Publish without deleting an object another process may have just
+            // produced. A concurrent identical upload is harmless.
+            if let Err(error) = std::fs::rename(&staging, &object) {
+                if manifest_path.is_file() {
+                    let _ = std::fs::remove_dir_all(&staging);
+                } else {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return Err(UbuilderError::io("cannot publish artifact object", error));
+                }
+            }
         }
-        let manifest = self.manifest(&sha256)?;
+        let manifest = self.verify_object(&sha256)?;
         let record = PipelineArtifactRecord {
             id: None,
             run_id: run_id.into(),
@@ -151,7 +168,7 @@ impl ArtifactStore {
             .map_err(|e| UbuilderError::io("cannot create download destination", e))?;
         let mut paths = Vec::new();
         for artifact in matching {
-            let manifest = self.manifest(&artifact.sha256)?;
+            let manifest = self.verify_object(&artifact.sha256)?;
             let tree = self
                 .root
                 .join("objects")
@@ -178,6 +195,37 @@ impl ArtifactStore {
             }
         }
         Ok(paths)
+    }
+
+    /// Validate the manifest and re-hash the immutable object before reuse.
+    fn verify_object(&self, sha256: &str) -> Result<ObjectManifest> {
+        let manifest = self.manifest(sha256)?;
+        if manifest.sha256 != sha256 {
+            return Err(UbuilderError::new(
+                ErrorCode::ArtifactInvalid,
+                format!("artifact manifest hash mismatch for {sha256}"),
+            ));
+        }
+        let payload = self
+            .root
+            .join("objects")
+            .join(sha256)
+            .join("tree")
+            .join(&manifest.root_name);
+        let actual = hash_path(&payload).map_err(|error| {
+            UbuilderError::new(
+                ErrorCode::ArtifactInvalid,
+                format!("artifact object {sha256} is corrupt: {}", error.message),
+            )
+        })?;
+        if actual != sha256 {
+            return Err(UbuilderError::new(
+                ErrorCode::ArtifactInvalid,
+                format!("artifact object {sha256} failed integrity verification"),
+            )
+            .remediation("Re-run the producing job; the content-addressed object is corrupt"));
+        }
+        Ok(manifest)
     }
 
     fn manifest(&self, sha256: &str) -> Result<ObjectManifest> {

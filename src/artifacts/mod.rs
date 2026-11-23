@@ -83,6 +83,9 @@ pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     }
     std::fs::create_dir_all(to)
         .map_err(|e| UbuilderError::io(format!("cannot create {}", to.display()), e))?;
+    let canonical_from = from
+        .canonicalize()
+        .map_err(|e| UbuilderError::io("cannot resolve source root", e))?;
     for entry in WalkDir::new(from)
         .follow_links(false)
         .sort_by_file_name()
@@ -121,6 +124,17 @@ pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
                 .path()
                 .canonicalize()
                 .map_err(|e| UbuilderError::io("cannot resolve symlink", e))?;
+            if !resolved.starts_with(&canonical_from) {
+                return Err(UbuilderError::new(
+                    ErrorCode::ArtifactInvalid,
+                    format!(
+                        "symlink {} escapes the packaged root {}",
+                        entry.path().display(),
+                        from.display()
+                    ),
+                )
+                .remediation("Copy the target inside the project or remove the symlink"));
+            }
             if resolved.is_file() {
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| {
@@ -401,5 +415,17 @@ mod tests {
             std::fs::read_to_string(dst.join("nested/file.txt")).unwrap(),
             "x"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_rejects_symlinks_escaping_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(tmp.path().join("outside.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("outside.txt"), src.join("link")).unwrap();
+        let error = copy_tree(&src, &tmp.path().join("dst")).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ArtifactInvalid);
     }
 }

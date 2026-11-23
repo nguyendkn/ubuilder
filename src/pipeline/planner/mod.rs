@@ -88,6 +88,8 @@ pub fn plan(ir: &WorkflowIr, source_root: &Path, host: &Host) -> Result<Workflow
             .unwrap_or(0)
     };
     let mut jobs = Vec::new();
+    let mut capabilities: std::collections::HashMap<String, BuildCapability> =
+        std::collections::HashMap::new();
     for job in &ir.jobs {
         let target = target_for(job);
         if target.is_none() {
@@ -108,9 +110,16 @@ pub fn plan(ir: &WorkflowIr, source_root: &Path, host: &Host) -> Result<Workflow
             ));
         }
         let capability = match (&project, &target, unsupported_reason.is_none()) {
-            (Some(project), Some(target), true) => Some(crate::adapters::resolve_capabilities(
-                project, host, target, &facts,
-            )),
+            (Some(project), Some(target), true) => {
+                if let Some(cached) = capabilities.get(&target.id) {
+                    Some(cached.clone())
+                } else {
+                    let resolved =
+                        crate::adapters::resolve_capabilities(project, host, target, &facts);
+                    capabilities.insert(target.id.clone(), resolved.clone());
+                    Some(resolved)
+                }
+            }
             _ => None,
         };
         if let Some(capability) = &capability {

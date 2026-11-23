@@ -3,9 +3,10 @@
 
 use crate::capability::Facts;
 use crate::host::Host;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const PROBE_COMMANDS: &[&str] = &[
@@ -53,7 +54,49 @@ const PROBE_COMMANDS: &[&str] = &[
     "git",
 ];
 
+const FACTS_TTL: Duration = Duration::from_secs(30);
+
+type FactsCache = HashMap<String, (Instant, Facts)>;
+
+fn facts_cache() -> &'static Mutex<FactsCache> {
+    static CACHE: OnceLock<Mutex<FactsCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Probe the host toolchain, reusing a recent result for the same host and
+/// project. Probing spawns dozens of subprocesses, which dominates planning.
 pub fn collect(host: &Host, project_root: Option<&Path>) -> Facts {
+    if std::env::var_os("UBUILDER_NO_FACTS_CACHE").is_some() {
+        return collect_uncached(host, project_root);
+    }
+    let key = format!(
+        "{}\n{}\n{}",
+        host.triple,
+        host.os_version.as_deref().unwrap_or(""),
+        project_root
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    );
+    if let Ok(cache) = facts_cache().lock() {
+        if let Some((at, facts)) = cache.get(&key) {
+            if at.elapsed() < FACTS_TTL {
+                return facts.clone();
+            }
+        }
+    }
+    let facts = collect_uncached(host, project_root);
+    if let Ok(mut cache) = facts_cache().lock() {
+        cache.insert(key, (Instant::now(), facts.clone()));
+    }
+    facts
+}
+
+/// Force a fresh toolchain probe, ignoring the short-lived process cache.
+pub fn collect_fresh(host: &Host, project_root: Option<&Path>) -> Facts {
+    collect_uncached(host, project_root)
+}
+
+fn collect_uncached(host: &Host, project_root: Option<&Path>) -> Facts {
     let mut facts = Facts::default();
     let mut commands = BTreeSet::new();
     for name in PROBE_COMMANDS {

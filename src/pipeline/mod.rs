@@ -18,6 +18,7 @@ pub mod parser;
 pub mod planner;
 pub mod runtime;
 pub mod schema;
+pub mod state;
 pub mod validator;
 
 pub use compiler::compile;

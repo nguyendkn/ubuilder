@@ -88,6 +88,9 @@ outputs (through the `needs` context) are the supported channels between jobs.
 | `pipeline cancel` | Request cancellation of a run |
 | `pipeline recover` | Fail interrupted `running` runs |
 | `pipeline actions` | List built-in actions and inputs |
+| `secret` | `list`, `set`, `delete`, `inspect` secret metadata |
+| `maintenance` | `stats`, `prune`, `gc`, `pin`, `unpin` run/artifact retention |
+| `daemon` | `start`, `stop`, `status`, `run`, `trigger` local triggers |
 
 All commands support `--json`; failures use the stable envelope
 `{"ok":false,"command":...,"error":{"code","message","remediation","details"}}`
@@ -105,13 +108,15 @@ configuration or unsupported toolchain, `130` cancelled.
 - [Built-in actions](docs/PIPELINE_ACTIONS.md)
 - [Examples](docs/PIPELINE_EXAMPLES.md)
 - [Implementation status](docs/PIPELINE_IMPLEMENTATION_STATUS.md)
+- [Production readiness](docs/production/FINAL_READINESS_REPORT.md)
+- [Operations runbook](docs/production/OPERATIONS_RUNBOOK.md)
 - [Example workflow](examples/native-matrix.yml)
 
 ## Tested platforms
 
-The pipeline is exercised on Windows 10 x64 (PowerShell default shell) with the
-`x86_64-pc-windows-msvc` Rust target. Linux is supported by the native adapters
-and covered by the cross-platform unit/contract tests, but has not been run
-end-to-end on a Linux host in this repository. macOS targets are planned but
-untested. Cross-target builds require the relevant linker and SDK; `pipeline
-plan` marks such targets as unsupported rather than pretending success.
+The pipeline is exercised on Windows 10.0.26300 x64 (PowerShell default shell)
+with the `x86_64-pc-windows-msvc` Rust target. Linux and macOS jobs are
+configured in CI but have not been executed in this environment; no native
+claim is made for them. Cross-target builds require the relevant linker and
+SDK; `pipeline plan` marks such targets unsupported or unverified rather than
+pretending success. See `docs/production/CROSS_PLATFORM_MATRIX.md`.

@@ -1,0 +1,91 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            asset: ubuilder-windows-x64.zip
+          - os: ubuntu-latest
+            platform: linux
+            asset: ubuilder-linux-x64.tar.gz
+          - os: macos-latest
+            platform: macos
+            asset: ubuilder-macos.tar.gz
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      UBUILDER_SIGN_COMMAND: ${{ secrets.UBUILDER_SIGN_COMMAND }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --all-targets --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: python scripts/package.py --platform ${{ matrix.platform }} --output dist
+      - name: Checksums
+        run: python scripts/checksums.py dist
+      - name: Sign (optional hook)
+        if: ${{ env.UBUILDER_SIGN_COMMAND != '' }}
+        shell: bash
+        run: eval "$UBUILDER_SIGN_COMMAND"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/SHA256SUMS
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: SBOM
+        run: |
+          mkdir -p dist
+          python scripts/sbom.py > dist/sbom.cdx.json
+          python scripts/checksums.py dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            dist/sbom.cdx.json
+            dist/SHA256SUMS
+  publish:
+    needs: [build, sbom]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten and combine checksums
+        run: |
+          mkdir -p release
+          find dist -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name 'sbom.cdx.json' \) -exec cp {} release/ \;
+          find dist -name SHA256SUMS -exec cat {} \; | sort -u > release/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.zip
+            release/*.tar.gz
+            release/SHA256SUMS
+            release/sbom.cdx.json
+          fail_on_unmatched_files: true

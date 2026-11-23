@@ -17,7 +17,7 @@ Các kết quả chính:
 - Workflow YAML có kiểm tra schema nghiêm ngặt, báo lỗi kèm dòng/cột.
 - Matrix jobs, sóng phụ thuộc (`needs`), workspace cô lập, artifacts, cache, retry, timeout, hủy chéo tiến trình và phục hồi run bị treo.
 - Lịch sử run/job/step lưu trong SQLite; có `status`, `logs`, `history`, `cancel`, `recover`.
-- **121 bài kiểm thử đều đạt**; `cargo fmt` và `cargo clippy -D warnings` sạch.
+- **139 bài kiểm thử đều đạt**; `cargo fmt` và `cargo clippy -D warnings` sạch.
 - Tài liệu kiến trúc, DSL, IR, runtime, bảo mật, actions, ví dụ và trạng thái triển khai đã được viết.
 - CI cho Windows và Ubuntu; ví dụ workflow chạy được đã được thêm.
 - Mã nguồn đã được commit sạch trong Git.
@@ -277,7 +277,7 @@ Giới hạn tài nguyên:
 
 ---
 
-## 6. Hạn chế và rủi ro còn lại
+## 6. Hạn chế, rủi ro và trạng thái xử lý
 
 | Hạn chế | Mức độ | Ghi chú |
 | --- | --- | --- |
@@ -285,13 +285,14 @@ Giới hạn tài nguyên:
 | macOS chưa kiểm chứng | Trung bình | Thiếu SDK/công cụ; plan báo capability thay vì giả thành công |
 | Cross-compile phụ thuộc linker/SDK | Trung bình | Target không khả dụng được báo lỗi rõ ràng |
 | `container` / `wsl` backend chưa cài đặt | Thấp | Planner từ chối kèm remediation |
-| Trigger `on:` chỉ là metadata | Thấp | Chưa có watcher Git hay scheduler |
-| `cancel-in-progress` chỉ được parse | Thấp | Không hủy lease đang giữ |
-| Secret store tối thiểu | Trung bình | `secrets` là map rỗng; chỉ redaction env |
-| Không tự động prune run/artifact/cache | Trung bình | Phải xóa thủ công |
-| Action step không capture stdout | Thấp | Chỉ run step có log/tail |
-| Cache bị vô hiệu khi sửa bất kỳ dòng YAML | Thấp | Do digest toàn workflow |
-| Fail-fast với `max-parallel > 1` không hủy sibling đang chạy | Thấp | Chỉ sibling chưa chạy bị skip |
+| Trigger | Thấp | Daemon polling Git/workflow + webhook loopback; cron do OS scheduler |
+| `cancel-in-progress` | Thấp | Đã triển khai qua cancel marker; chưa có test riêng |
+| Secret store | Đã xử lý | Env/file provider, resolve fail-closed, redaction; không có keychain |
+| Retention | Đã xử lý | `maintenance stats/prune/gc/pin/unpin`; pin bảo vệ artifact |
+| Action step stdout | Đã xử lý | Message được lưu vào output và log |
+| Cache | Đã xử lý | Key theo step, không phụ thuộc digest toàn workflow |
+| Fail-fast | Đã xử lý | Không serialize matrix; sibling đang chạy được hoàn tất |
+| Sandbox OS | Trung bình | Workspace chỉ là ranh giới thư mục, không phải sandbox bảo mật |
 
 Rủi ro vận hành chính: pipeline chạy lệnh tùy ý với quyền người dùng, không phải sandbox bảo mật. Workspace cô lập ngăn ghi đè giữa job nhưng không ngăn tiến trình cố ý ghi ra ngoài.
 
@@ -299,13 +300,13 @@ Rủi ro vận hành chính: pipeline chạy lệnh tùy ý với quyền ngư�
 
 ## 7. Đề xuất tiếp theo
 
-1. **Chạy CI thực tế trên Ubuntu và bổ sung macOS runner** để xác nhận Linux/macOS end-to-end.
+1. **Chạy CI thực tế trên Ubuntu và macOS** để xác nhận Linux/macOS end-to-end.
 2. **Thêm integration test cho `setup-rust` / `setup-dotnet` / `setup-node` và `verify`**, hiện mới được phủ qua unit/legacy.
 3. **Kiểm thử cross-compile có điều kiện** khi linker/SDK tồn tại; giữ hành vi báo lỗi rõ ràng khi thiếu.
-4. **Bổ sung retention/prune** cho runs, artifacts và cache theo thời gian hoặc dung lượng.
-5. **Thiết kế secret provider** (env, file, OS keychain) và redaction chặt hơn.
-6. **Capture stdout cho action step** để log/status nhất quán với run step.
-7. **Triển khai trigger watcher** nếu muốn dùng như CI/CD thực thụ, thay vì chỉ chạy thủ công.
+4. **Bổ sung OS sandbox** cho workflow không tin cậy (container/WSL hoặc Job Object).
+5. **Thêm dependency audit** (`cargo-audit`/`cargo-deny`) vào CI cùng SBOM.
+6. **Kiểm thử daemon start/stop/webhook** trong CI và thêm TLS reverse-proxy guidance.
+7. **Thêm heartbeat cho concurrency slot** để thu hồi sớm sau crash thay vì chờ lease 1 giờ.
 
 ---
 
@@ -322,6 +323,6 @@ Repository hiện sạch; các thư mục còn lại chỉ là output sinh tự 
 
 ## 9. Kết luận
 
-Tầng pipeline đã đạt mục tiêu: khai báo bằng YAML, thực thi cục bộ có cô lập, tái sử dụng engine build sẵn có, lưu lịch sử và báo cáo có cấu trúc. Legacy build không bị ảnh hưởng. Chất lượng được chứng minh bằng 121 bài kiểm thử, clippy sạch và các lần chạy workflow thật trên Windows x64.
+Tầng pipeline đã đạt mục tiêu: khai báo bằng YAML, thực thi cục bộ có cô lập, tái sử dụng engine build sẵn có, lưu lịch sử và báo cáo có cấu trúc. Legacy build không bị ảnh hưởng. Chất lượng được chứng minh bằng 139 bài kiểm thử, clippy sạch và các lần chạy workflow thật trên Windows x64.
 
-Phần còn thiếu chủ yếu là kiểm chứng đa nền tảng thực tế và các tính năng vận hành nâng cao (trigger, prune, secret store). Những mục này đã được ghi rõ trong tài liệu trạng thái thay vì tuyên bố quá mức.
+Phần còn thiếu chủ yếu là kiểm chứng đa nền tảng thực tế, OS sandbox và dependency audit. Những mục này đã được ghi rõ trong tài liệu trạng thái thay vì tuyên bố quá mức.

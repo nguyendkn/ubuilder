@@ -421,6 +421,7 @@ mod tests {
     use crate::planner::{BuildPlan, BuildStep};
     use crate::project::FrameworkKind;
     use crate::target::Target;
+    use std::io::Write;
 
     fn plan() -> BuildPlan {
         BuildPlan::new(
@@ -504,6 +505,25 @@ mod tests {
         assert!(cache.restore_tree("shared", &dest).unwrap());
         assert_eq!(std::fs::read_to_string(dest.join("f.txt")).unwrap(), "same");
         assert_eq!(cache.db().cache_records().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn extraction_rejects_traversal_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("evil.zip");
+        {
+            let file = File::create(&archive).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file("../escaped.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"pwned").unwrap();
+            writer.finish().unwrap();
+        }
+        let dest = tmp.path().join("dest");
+        let error = extract_zip(&archive, &dest).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Usage);
+        assert!(!tmp.path().join("escaped.txt").exists());
     }
 
     #[test]

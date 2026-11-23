@@ -558,3 +558,303 @@ fn open_db(host: &Host) -> Result<Db> {
     }
     Db::open(&path)
 }
+
+#[derive(Debug, Subcommand)]
+pub enum MaintenanceCommand {
+    /// Show database, cache, log and artifact disk usage.
+    Stats,
+    /// Delete old terminal runs according to retention policy.
+    Prune(PruneArgs),
+    /// Remove artifact objects no retained run references.
+    Gc(GcArgs),
+    /// Protect an artifact object from garbage collection.
+    Pin(PinArgs),
+    /// Remove protection from an artifact object.
+    Unpin { sha256: String },
+}
+
+#[derive(Debug, Args)]
+pub struct PruneArgs {
+    /// Delete terminal runs older than this many days.
+    #[arg(long, default_value_t = 30)]
+    pub max_age_days: u64,
+    /// Always keep at least this many newest terminal runs.
+    #[arg(long, default_value_t = 100)]
+    pub max_runs: usize,
+    /// Approximate retained artifact bytes; oldest runs are pruned first.
+    #[arg(long, default_value_t = 4096)]
+    pub max_size_mb: u64,
+    /// Report what would be deleted without changing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct GcArgs {
+    /// Report unreferenced objects without deleting them.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PinArgs {
+    /// Full SHA-256 or a unique prefix.
+    pub sha256: String,
+    /// Optional human-readable label.
+    #[arg(long)]
+    pub name: Option<String>,
+}
+
+pub fn maintenance(_cli: &Cli, command: &MaintenanceCommand, ui: &Ui) -> Result<i32> {
+    let host = host()?;
+    let data_dir = host.data_dir();
+    let db = Db::open(&data_dir.join("ubuilder.db"))?;
+    match command {
+        MaintenanceCommand::Stats => {
+            let runs = db.all_pipeline_runs()?;
+            let active = runs
+                .iter()
+                .filter(|run| {
+                    !matches!(
+                        run.status.as_str(),
+                        "success"
+                            | "failure"
+                            | "cancelled"
+                            | "skipped"
+                            | "blocked"
+                            | "timed_out"
+                            | "interrupted"
+                    )
+                })
+                .count();
+            let refs = db.pipeline_artifact_references()?;
+            let artifact_bytes: u64 = refs.values().map(|(_, size)| *size).sum();
+            let stats = json!({
+                "data_dir": data_dir,
+                "database_bytes": dir_size(&data_dir.join("ubuilder.db")),
+                "pipeline_root_bytes": dir_size(&data_dir.join("pipeline")),
+                "runs_root_bytes": dir_size(&data_dir.join("pipeline/runs")),
+                "artifact_objects_bytes": dir_size(&data_dir.join("pipeline/artifacts/objects")),
+                "cache_bytes": dir_size(&data_dir.join("pipeline/cache")),
+                "runs": runs.len(),
+                "active_runs": active,
+                "artifact_references": refs.values().map(|(count, _)| count).sum::<u64>(),
+                "artifact_referenced_bytes": artifact_bytes,
+                "pinned_artifacts": db.pinned_artifacts()?.len(),
+            });
+            if !ui.json() {
+                ui.info(format!("data: {}", data_dir.display()));
+                ui.info(format!(
+                    "runs: {} ({} active)",
+                    stats["runs"], stats["active_runs"]
+                ));
+                ui.info(format!(
+                    "artifact objects: {} bytes; referenced: {} bytes",
+                    stats["artifact_objects_bytes"], stats["artifact_referenced_bytes"]
+                ));
+                ui.info(format!("cache: {} bytes", stats["cache_bytes"]));
+            }
+            Ok(ok(ui, "maintenance stats", stats))
+        }
+        MaintenanceCommand::Prune(args) => {
+            let runs = db.all_pipeline_runs()?;
+            let refs = db.pipeline_artifact_references()?;
+            let pinned: std::collections::BTreeSet<String> = db
+                .pinned_artifacts()?
+                .into_iter()
+                .map(|(sha, _)| sha)
+                .collect();
+            let now = crate::telemetry::now_ms();
+            let cutoff = now.saturating_sub(args.max_age_days as u128 * 86_400_000);
+            let mut deleted = Vec::new();
+            let mut retained_bytes = 0u64;
+            let mut kept = 0usize;
+            // Newest first: retention always preserves the newest runs.
+            for run in &runs {
+                let terminal = matches!(
+                    run.status.as_str(),
+                    "success"
+                        | "failure"
+                        | "cancelled"
+                        | "skipped"
+                        | "blocked"
+                        | "timed_out"
+                        | "interrupted"
+                );
+                let run_artifacts = db.pipeline_artifacts(&run.id)?;
+                let bytes: u64 = run_artifacts
+                    .iter()
+                    .map(|a| refs.get(&a.sha256).map(|(_, size)| *size).unwrap_or(a.size))
+                    .sum();
+                let protected = run_artifacts
+                    .iter()
+                    .any(|artifact| pinned.contains(&artifact.sha256));
+                if !terminal {
+                    continue;
+                }
+                let too_old = run.created_at < cutoff;
+                let too_many = kept >= args.max_runs;
+                let too_large =
+                    retained_bytes.saturating_add(bytes) > args.max_size_mb * 1024 * 1024;
+                let should_delete = !protected && (too_old || too_many || too_large);
+                if should_delete {
+                    if !args.dry_run {
+                        db.delete_pipeline_run(&run.id)?;
+                        let dir = data_dir.join("pipeline").join("runs").join(&run.id);
+                        if dir.is_dir() {
+                            let _ = std::fs::remove_dir_all(dir);
+                        }
+                    }
+                    deleted.push(json!({
+                        "run_id": run.id,
+                        "status": run.status,
+                        "created_at": run.created_at,
+                        "bytes": bytes,
+                    }));
+                } else {
+                    kept += 1;
+                    retained_bytes = retained_bytes.saturating_add(bytes);
+                }
+            }
+            let report = json!({
+                "dry_run": args.dry_run,
+                "deleted": deleted,
+                "deleted_count": deleted.len(),
+                "retained_bytes": retained_bytes,
+            });
+            if !ui.json() {
+                if deleted.is_empty() {
+                    ui.info("nothing to prune");
+                }
+                for item in &deleted {
+                    ui.info(format!(
+                        "{} {} ({} bytes){}",
+                        if args.dry_run {
+                            "would delete"
+                        } else {
+                            "deleted"
+                        },
+                        item["run_id"],
+                        item["bytes"],
+                        ""
+                    ));
+                }
+            }
+            Ok(ok(ui, "maintenance prune", report))
+        }
+        MaintenanceCommand::Gc(args) => {
+            let refs = db.pipeline_artifact_references()?;
+            let pinned: std::collections::BTreeSet<String> = db
+                .pinned_artifacts()?
+                .into_iter()
+                .map(|(sha, _)| sha)
+                .collect();
+            let objects = data_dir.join("pipeline").join("artifacts").join("objects");
+            let mut removed = Vec::new();
+            let mut removed_bytes = 0u64;
+            if let Ok(entries) = std::fs::read_dir(&objects) {
+                for entry in entries.flatten() {
+                    if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let sha = entry.file_name().to_string_lossy().to_string();
+                    if refs.contains_key(&sha) || pinned.contains(&sha) {
+                        continue;
+                    }
+                    let bytes = dir_size(&entry.path());
+                    if !args.dry_run {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                    removed_bytes += bytes;
+                    removed.push(sha);
+                }
+            }
+            let report = json!({
+                "dry_run": args.dry_run,
+                "removed": removed,
+                "removed_count": removed.len(),
+                "removed_bytes": removed_bytes,
+            });
+            if !ui.json() {
+                if removed.is_empty() {
+                    ui.info("no unreferenced artifact objects");
+                } else {
+                    ui.info(format!(
+                        "{} {} objects ({} bytes)",
+                        if args.dry_run {
+                            "would remove"
+                        } else {
+                            "removed"
+                        },
+                        removed.len(),
+                        removed_bytes
+                    ));
+                }
+            }
+            Ok(ok(ui, "maintenance gc", report))
+        }
+        MaintenanceCommand::Pin(args) => {
+            let refs = db.pipeline_artifact_references()?;
+            let matches: Vec<&String> = refs
+                .keys()
+                .filter(|sha| sha.starts_with(&args.sha256))
+                .collect();
+            let sha = match matches.as_slice() {
+                [sha] => (*sha).clone(),
+                [] => {
+                    let error = UbuilderError::new(
+                        ErrorCode::ArtifactInvalid,
+                        format!("no artifact object matches '{}'", args.sha256),
+                    );
+                    return Ok(fail(ui, "maintenance pin", &error, None));
+                }
+                _ => {
+                    let error = UbuilderError::new(
+                        ErrorCode::ArtifactInvalid,
+                        format!("artifact prefix '{}' is ambiguous", args.sha256),
+                    );
+                    return Ok(fail(ui, "maintenance pin", &error, None));
+                }
+            };
+            let name = args.name.clone().unwrap_or_else(|| sha.clone());
+            db.pin_artifact(&sha, &name)?;
+            if !ui.json() {
+                ui.success(format!("pinned {sha} ({name})"));
+            }
+            Ok(ok(
+                ui,
+                "maintenance pin",
+                json!({ "sha256": sha, "name": name }),
+            ))
+        }
+        MaintenanceCommand::Unpin { sha256 } => {
+            let removed = db.unpin_artifact(sha256)?;
+            if !ui.json() {
+                if removed {
+                    ui.success(format!("unpinned {sha256}"));
+                } else {
+                    ui.warn(format!("no pin for {sha256}"));
+                }
+            }
+            Ok(ok(
+                ui,
+                "maintenance unpin",
+                json!({ "sha256": sha256, "removed": removed }),
+            ))
+        }
+    }
+}
+
+fn dir_size(path: &std::path::Path) -> u64 {
+    if path.is_file() {
+        return std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    }
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        total = total.saturating_add(dir_size(&entry.path()));
+    }
+    total
+}

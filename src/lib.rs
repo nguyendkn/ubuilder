@@ -22,6 +22,7 @@ pub mod planner;
 pub mod project;
 pub mod providers;
 pub mod scheduler;
+pub mod secrets;
 pub mod security;
 pub mod signing;
 pub mod storage;

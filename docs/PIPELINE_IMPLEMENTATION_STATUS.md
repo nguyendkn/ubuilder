@@ -1,23 +1,23 @@
 # Implementation status
 
-Last verified: 2026-11-23 on Windows 10 x64, Rust 1.99.1, PowerShell default
-shell, native target `windows-x64`.
+Last verified: 2026-11-23 on Windows 10.0.26300 x64, Rust 1.99.1, PowerShell
+default shell, native target `windows-x64`.
 
 ## Test suite
 
 `cargo test --all-targets --locked` passes:
 
 | Suite | Tests | Coverage |
-| --- | --- | --- |
-| Library unit tests | 92 | parser, validator, compiler, matrix, expressions, planner, artifacts, cache, storage, executor |
-| `tests/cli.rs` | 6 | legacy CLI, detection, project reporting |
+| --- | ---: | --- |
+| Library unit tests | 100 | parser, validator, compiler, matrix, expressions, planner, artifacts, cache, storage, state machine, executor |
 | `tests/builds.rs` | 1 | real Rust build, packaging, validation, manifest |
+| `tests/cli.rs` | 6 | legacy CLI, detection, project reporting |
 | `tests/compatibility.rs` | 2 | target compatibility matrix |
 | `tests/pipeline_contract.rs` | 7 | validation, diagnostics, matrix plan, graph formats, cycles, init/list |
-| `tests/pipeline_runtime.rs` | 13 | full runs, artifacts, cache, fail-fast, parallel jobs, timeout, cancellation, retry, continue-on-error, outputs, recovery |
+| `tests/pipeline_runtime.rs` | 23 | full runs, artifacts, cache, fail-fast, parallelism, timeout, cancellation, retry, continue-on-error, outputs, recovery, secrets, concurrency slots, retention/pinning/GC, daemon once mode |
 
 `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`
-also pass.
+also pass. Criterion benchmarks live in `benches/pipeline.rs`.
 
 ## Implemented and exercised
 
@@ -30,46 +30,54 @@ also pass.
 | Dependency waves | Tested | contract plan waves, runtime tests |
 | Isolated workspaces | Tested | distinct workspace paths, artifact transfer |
 | Built-in actions (11) | Partial | runtime build/package/upload/download/checksum/cache; setup/verify via unit and legacy tests |
-| Local artifact store | Tested | content-addressed upload + download across jobs |
-| Pipeline cache | Tested | miss then hit integration test |
-| Fail-fast matrix siblings | Tested | sibling skipped after failure |
+| Action stdout capture | Tested | message stored as output and step log |
+| Local artifact store | Tested | content-addressed upload + download + integrity verification |
+| Pipeline cache | Tested | miss/hit, unrelated-edit survival, corruption detection |
+| Fail-fast matrix siblings | Tested | sibling skipped, parallelism preserved |
 | Parallel independent jobs | Tested | two 2 s jobs complete under 4 s of run time |
 | Step timeout and process-tree kill | Tested | 1 s timeout on a 10 s sleep |
 | Cross-process cancellation | Tested | `pipeline cancel`, exit 130, `cancelled` status |
 | Retry policy | Tested | fail-then-succeed across attempts |
-| `continue-on-error` | Tested | status `failure`, conclusion `success`, job continues |
+| `continue-on-error` | Tested | status `failure`, conclusion `success` |
 | Job outputs / `needs` context | Tested | produced value consumed by dependent job |
-| `--job` filtering | Tested | only selected job recorded |
-| SQLite persistence + status/history/logs | Tested | status rows, DB inspection in tests |
+| Concurrency groups | Tested | bounded slots; serialization without deadlock |
+| `cancel-in-progress` | Implemented | peers receive a cancel marker; not covered by a dedicated test |
+| Typed lifecycle | Tested | transition table + transactional rejection (`STATE_INVALID`) |
+| SQLite persistence | Tested | status/history/logs, transitions, retention |
+| Secret providers and redaction | Tested | fail-closed resolution, CLI masking, report redaction |
+| Retention / pin / GC | Tested | prune newest, active protection, pinned objects survive GC |
 | Stale run recovery | Tested | killed process recovered to `failed` |
 | JSON envelopes and exit codes | Tested | 1 / 2 / 3 / 130 cases |
 | Mermaid / DOT / JSON graph | Tested | contract test |
+| Trigger daemon | Partial | git/workflow fingerprint + loopback webhook + once mode |
 | Production example workflows | Tested | validate + plan + real run on Windows |
 
 ## Partial / untested
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Linux end-to-end | Untested on a Linux host | Tests are written cross-platform; CI config includes Ubuntu but has not run here |
-| macOS targets | Untested | Requires macOS host or SDK; plan reports capability |
-| Cross-compilation | Untested | Depends on installed targets/linkers; unsupported targets are reported, not faked |
+| Linux end-to-end | Untested on a Linux host | CI includes Ubuntu; not executed here |
+| macOS targets | Untested | No host/SDK; CI includes macOS |
+| Cross-compilation | Untested | Target installed but linker unverified |
 | `container` / `wsl` backends | Not implemented | Planner rejects them with a remediation |
-| Trigger execution | Metadata only | `on:` is parsed/validated; no git watcher or scheduler |
-| `cancel-in-progress` | Parsed only | Existing lease holders are not cancelled |
-| Secret store | Minimal | `secrets` is empty; env redaction only |
-| Automatic retention/pruning | Not implemented | No TTL or size cap for runs/artifacts/cache |
+| Daemon detached start/stop/webhook | Not integration-tested | Once mode is tested; loopback HTTP and PID lifecycle are code-verified only |
+| `cancel-in-progress` | Implemented, untested | Uses the cross-process cancel marker |
+| OS sandbox | Not implemented | Jobs share the invoking user's filesystem permissions |
+| Dependency audit | Not run | `cargo-audit`/`cargo-deny` absent; SBOM generated |
+| Signing / notarization | Hook only | No credentials |
 | Remote action marketplace | Not implemented | Only compiled-in `builtin/*` actions |
 | Artifact compression/dedup | Content-addressed only | Identical content reuses one object; no compression |
 
 ## Known limitations
 
-- Fail-fast skips siblings that have not started. With an explicit
-  `max-parallel > 1`, running siblings are allowed to finish.
-- Cache keys include the whole workflow digest, so any workflow edit
-  invalidates all caches for that workflow.
-- Action steps do not currently capture stdout; only run steps have streamed
-  logs and tails.
+- Fail-fast stops new sibling scheduling; running siblings finish.
+- Cache keys are step-scoped; callers must include toolchain inputs.
 - Job-level timeout is enforced around the whole body; a process that ignores
   termination may delay the report.
-- The `pipeline plan` capability probe costs a few seconds on hosts with many
-  toolchain checks but performs no writes.
+- A crashed run can hold a concurrency slot until its 1 h lease expires.
+- Planning is ~71 ms warm for 48 jobs and ~4.5 s cold due to toolchain probes.
+- Schema creation is idempotent but a newer schema version is not rejected.
+- Logs and workspaces are not encrypted; retention is explicit.
+
+See `docs/production/` for the audit, threat model, risk register, performance
+baseline and final readiness verdict.

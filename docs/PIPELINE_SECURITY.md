@@ -25,16 +25,19 @@ The pipeline runs arbitrary user-authored commands. Its security boundary is:
 ## Trust assumptions
 
 The workflow file and the project source are trusted inputs. A workflow can run
-any command the invoking user can run. Secrets are not injected automatically;
-`secrets` is an empty map. Environment filtering reduces accidental leakage but
-is not a sandbox against malicious code.
+any command the invoking user can run. There is no OS sandbox: workspace
+isolation is a directory boundary, not a security boundary. Secrets are
+resolved only for names referenced by the workflow, and resolution is
+fail-closed before the first job.
 
 ## Data at rest
 
 Run history, logs, workspaces, artifacts and cache entries are stored under the
 data directory (default platform data dir, overridable with
-`UBUILDER_DATA_DIR`). They are not encrypted. Manual deletion of the data
-directory is the retention mechanism; there is no automatic pruning.
+`UBUILDER_DATA_DIR`). They are not encrypted. `maintenance stats/prune/gc`
+implements explicit, policy-driven retention; pinned artifacts and active runs
+are protected. Secrets in the file provider are stored with restrictive
+permissions where the platform supports them.
 
 ## Cancellation and process cleanup
 
@@ -45,7 +48,11 @@ still write outside the workspace; that is inherent to running local commands.
 
 ## Secrets
 
-Redaction is applied to captured stdout/stderr using values discovered from the
-environment via the existing security module. Prefer passing secrets as
-environment values at invocation time. Avoid committing them to workflow files:
-workflow source is stored in run metadata and can be inspected later.
+`ubuilder secret set NAME` stores a value in the file provider (`--stdin`,
+`--file` or prompt). Environment variables (`UBUILDER_SECRET_NAME`, then `NAME`)
+take precedence. Resolution happens once per run from names referenced in the
+IR; a missing name fails the run before any job starts. Raw values are used for
+`needs.*.outputs` in memory, but reports, logs, errors and JSON are redacted.
+`secret list` and `secret inspect` never print values. Prefer stdin over
+`secret set --value`, which exposes the value in process arguments. Workflow
+source is stored in run metadata, so never commit secret literals.

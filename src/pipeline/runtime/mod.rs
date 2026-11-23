@@ -17,6 +17,8 @@ use crate::pipeline::expression::context::Context;
 use crate::pipeline::expression::Template;
 use crate::pipeline::ir::{IrJob, IrStep, IrStepKind, WorkflowIr};
 use crate::pipeline::planner;
+use crate::pipeline::state::RunState;
+use crate::secrets::SecretManager;
 use crate::storage::{Db, PipelineJobRecord, PipelineRunRecord, PipelineStepRecord};
 use crate::telemetry::{now_ms, Ui};
 use indexmap::IndexMap;
@@ -52,7 +54,7 @@ pub struct RunReport {
     pub workflow: String,
     pub source_path: PathBuf,
     pub source_digest: String,
-    pub status: String,
+    pub status: RunState,
     pub started_at: u128,
     pub finished_at: u128,
     pub duration_ms: u128,
@@ -69,7 +71,7 @@ pub struct JobReport {
     pub id: String,
     pub base_id: String,
     pub name: String,
-    pub status: String,
+    pub status: RunState,
     pub conclusion: Option<String>,
     pub started_at: u128,
     pub finished_at: u128,
@@ -79,13 +81,17 @@ pub struct JobReport {
     pub steps: Vec<StepReport>,
     pub outputs: IndexMap<String, String>,
     pub error: Option<String>,
+    /// Raw values used for downstream `needs.*.outputs`; may contain a secret
+    /// and is therefore never serialized.
+    #[serde(skip)]
+    pub summary_outputs: IndexMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepReport {
     pub id: String,
     pub name: String,
-    pub status: String,
+    pub status: RunState,
     pub conclusion: Option<String>,
     pub exit_code: Option<i32>,
     pub duration_ms: u128,
@@ -96,9 +102,9 @@ pub struct StepReport {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct JobSummary {
-    status: String,
+    status: RunState,
     outputs: IndexMap<String, String>,
 }
 
@@ -106,6 +112,7 @@ struct Shared {
     run_id: String,
     ir: WorkflowIr,
     source_root: PathBuf,
+    data_dir: PathBuf,
     host: Host,
     db: Arc<Db>,
     artifacts: ArtifactStore,
@@ -115,6 +122,8 @@ struct Shared {
     cancel: CancellationToken,
     inputs: IndexMap<String, String>,
     workflow_env: IndexMap<String, String>,
+    secret_values: BTreeMap<String, String>,
+    secret_redactions: Vec<String>,
     jobs_root: PathBuf,
     logs_root: PathBuf,
     no_cache: bool,
@@ -190,6 +199,17 @@ pub async fn run(
         }
     }));
 
+    // Resolve only secrets named by the workflow. Values stay in memory and
+    // are never written to the IR, plan, database or JSON report.
+    let secret_manager = SecretManager::open(data_dir)?;
+    let secret_representation = serde_json::to_string(ir)
+        .map_err(|error| UbuilderError::new(ErrorCode::Internal, error.to_string()))?;
+    let secret_values: BTreeMap<String, String> = secret_manager
+        .resolve_referenced(&secret_representation)?
+        .into_iter()
+        .map(|(name, value)| (name, value.into_inner()))
+        .collect();
+    let secret_redactions: Vec<String> = secret_values.values().cloned().collect();
     let artifacts = ArtifactStore::open(&pipeline_root.join("artifacts"), db.clone())?;
     let cache_enabled = !options.no_cache;
     let cache = PipelineCache::open(
@@ -210,23 +230,22 @@ pub async fn run(
         &IndexMap::new(),
         &Context::new(),
         None,
+        &secret_values,
     );
     let workflow_env = evaluate_env(&ir.env, &workflow_context)
         .map_err(|e| e.remediation("Check workflow-level env templates"))?;
 
     let mut semaphores = HashMap::new();
     for job in ir.jobs.iter().filter(|job| selected.contains(&job.id)) {
-        // Fail-fast needs deterministic completion order between siblings; matrix
-        // jobs therefore run one at a time unless `max-parallel` opts into
-        // concurrency (in-flight siblings are never cancelled).
-        let limit = job
-            .max_parallel
-            .unwrap_or(if job.fail_fast && !job.matrix.is_empty() {
-                1
-            } else {
-                256
-            })
-            .max(1);
+        // Fail-fast never changes the concurrency limit. Matrix siblings are
+        // bounded by `max-parallel`, or by host parallelism when it is absent.
+        // Already-running siblings finish; siblings that have not acquired a
+        // permit are skipped once a failure is recorded.
+        let default_limit = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(2)
+            .max(2);
+        let limit = job.max_parallel.unwrap_or(default_limit).max(1);
         semaphores
             .entry(job.base_id.clone())
             .or_insert_with(|| Arc::new(Semaphore::new(limit)));
@@ -235,6 +254,7 @@ pub async fn run(
         run_id: run_id.clone(),
         ir: ir.clone(),
         source_root: source_root.to_path_buf(),
+        data_dir: data_dir.to_path_buf(),
         host: host.clone(),
         db: db.clone(),
         artifacts,
@@ -244,6 +264,8 @@ pub async fn run(
         cancel: cancel.clone(),
         inputs: options.inputs.clone(),
         workflow_env,
+        secret_values,
+        secret_redactions,
         jobs_root: workspace_root.clone(),
         logs_root: logs_root.clone(),
         no_cache: options.no_cache,
@@ -257,7 +279,7 @@ pub async fn run(
         workflow: ir.name.clone(),
         source_path: ir.source_path.clone(),
         source_digest: ir.source_digest.clone(),
-        status: "running".into(),
+        status: RunState::Running.as_str().into(),
         created_at: started_at,
         started_at: Some(started_at),
         finished_at: None,
@@ -267,7 +289,15 @@ pub async fn run(
         error: None,
     })?;
     for job in ir.jobs.iter().filter(|job| selected.contains(&job.id)) {
-        persist_job(&db, &run_id, job, "queued", None, None, &IndexMap::new())?;
+        persist_job(
+            &db,
+            &run_id,
+            job,
+            RunState::Pending,
+            None,
+            None,
+            &IndexMap::new(),
+        )?;
     }
     events.run_start(&run_id, &ir.name);
 
@@ -290,8 +320,8 @@ pub async fn run(
             match joined {
                 Ok(report) => {
                     let summary = JobSummary {
-                        status: report.status.clone(),
-                        outputs: report.outputs.clone(),
+                        status: report.status,
+                        outputs: report.summary_outputs.clone(),
                     };
                     shared.record_summary(&report.id, summary);
                     reports.insert(report.id.clone(), report);
@@ -336,19 +366,25 @@ pub async fn run(
     let cancelled = cancel.is_cancelled();
     let failed = jobs
         .iter()
-        .any(|job| matches!(job.status.as_str(), "failure" | "cancelled"));
+        .any(|job| matches!(job.status, RunState::Failed | RunState::Cancelled));
     let status = if cancelled {
-        "cancelled"
+        RunState::Cancelled
     } else if failed {
-        "failure"
+        RunState::Failed
     } else {
-        "success"
+        RunState::Succeeded
     };
     let error = jobs
         .iter()
         .find(|job| job.error.is_some())
-        .and_then(|job| job.error.clone());
-    db.update_pipeline_run(&run_id, status, error.as_deref(), Some(finished_at))?;
+        .and_then(|job| job.error.clone())
+        .map(|message| crate::security::redact(&message, &shared.secret_redactions));
+    db.update_pipeline_run(
+        &run_id,
+        status.as_str(),
+        error.as_deref(),
+        Some(finished_at),
+    )?;
     let artifacts = shared
         .db
         .pipeline_artifacts(&run_id)?
@@ -365,13 +401,13 @@ pub async fn run(
         })
         .collect::<Vec<_>>();
     let duration_ms = finished_at.saturating_sub(started_at);
-    events.run_finish(&run_id, status, duration_ms);
+    events.run_finish(&run_id, status.as_str(), duration_ms);
     Ok(RunReport {
         run_id,
         workflow: ir.name.clone(),
         source_path: ir.source_path.clone(),
         source_digest: ir.source_digest.clone(),
-        status: status.into(),
+        status,
         started_at,
         finished_at,
         duration_ms,
@@ -466,6 +502,7 @@ fn base_context(
     env: &IndexMap<String, String>,
     parent: &Context,
     job: Option<&IrJob>,
+    secrets: &BTreeMap<String, String>,
 ) -> Context {
     let mut context = Context::new();
     context.success = parent.success;
@@ -516,7 +553,7 @@ fn base_context(
                 "outputs": step.outputs,
                 "status": step.status,
                 "conclusion": step.conclusion,
-                "outcome": step.conclusion,
+                "outcome": step.status,
             }),
         );
     }
@@ -525,7 +562,10 @@ fn base_context(
         "env",
         Value::Object(env.iter().map(|(k, v)| (k.clone(), json!(v))).collect()),
     );
-    context.insert("secrets", Value::Object(serde_json::Map::new()));
+    context.insert(
+        "secrets",
+        Value::Object(secrets.iter().map(|(k, v)| (k.clone(), json!(v))).collect()),
+    );
     context
 }
 
@@ -533,7 +573,7 @@ fn needs_value(shared: &Shared, job: &IrJob) -> IndexMap<String, Value> {
     let mut needs = IndexMap::new();
     for need in &job.needs {
         let summary = shared.summary(need).unwrap_or(JobSummary {
-            status: "skipped".into(),
+            status: RunState::Skipped,
             outputs: IndexMap::new(),
         });
         needs.insert(
@@ -545,6 +585,13 @@ fn needs_value(shared: &Shared, job: &IrJob) -> IndexMap<String, Value> {
         );
     }
     needs
+}
+
+fn redact_map(values: &IndexMap<String, String>, secrets: &[String]) -> IndexMap<String, String> {
+    values
+        .iter()
+        .map(|(key, value)| (key.clone(), crate::security::redact(value, secrets)))
+        .collect()
 }
 
 fn evaluate_env(
@@ -569,7 +616,7 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
         id: job.id.clone(),
         base_id: job.base_id.clone(),
         name: job.name.clone(),
-        status: "queued".into(),
+        status: RunState::Pending,
         conclusion: None,
         started_at,
         finished_at: started_at,
@@ -579,17 +626,24 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
         steps: Vec::new(),
         outputs: IndexMap::new(),
         error: None,
+        summary_outputs: IndexMap::new(),
     };
 
     if shared.cancel.is_cancelled() {
-        return finish_skipped(shared.as_ref(), job, report, "cancelled", "run cancelled");
+        return finish_skipped(
+            shared.as_ref(),
+            job,
+            report,
+            RunState::Cancelled,
+            "run cancelled",
+        );
     }
     if job.fail_fast
         && shared.ir.jobs.iter().any(|candidate| {
             candidate.base_id == job.base_id
                 && shared
                     .summary(&candidate.id)
-                    .map(|summary| summary.status == "failure")
+                    .map(|summary| summary.status == RunState::Failed)
                     .unwrap_or(false)
         })
     {
@@ -597,7 +651,7 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
             shared.as_ref(),
             job,
             report,
-            "skipped",
+            RunState::Skipped,
             "skipped because a matrix sibling failed",
         );
     }
@@ -611,7 +665,7 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
             candidate.base_id == job.base_id
                 && shared
                     .summary(&candidate.id)
-                    .map(|summary| summary.status == "failure")
+                    .map(|summary| summary.status == RunState::Failed)
                     .unwrap_or(false)
         })
     {
@@ -619,7 +673,7 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
             shared.as_ref(),
             job,
             report,
-            "skipped",
+            RunState::Skipped,
             "skipped because a matrix sibling failed",
         );
     }
@@ -636,12 +690,12 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
         );
     }
 
-    report.status = "running".into();
+    report.status = RunState::Running;
     let _ = persist_job(
         &shared.db,
         &shared.run_id,
         &job,
-        "running",
+        RunState::Running,
         Some(started_at),
         None,
         &IndexMap::new(),
@@ -657,7 +711,7 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
     let needs_ok = job.needs.iter().all(|need| {
         shared
             .summary(need)
-            .map(|s| s.status == "success")
+            .map(|s| s.status == RunState::Succeeded)
             .unwrap_or(false)
     });
     let mut context = base_context(
@@ -670,6 +724,7 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
         &shared.workflow_env,
         &Context::new(),
         Some(&job),
+        &shared.secret_values,
     );
     context.success = needs_ok;
     context.failure = !needs_ok;
@@ -698,7 +753,7 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
                     shared.as_ref(),
                     job,
                     report,
-                    "skipped",
+                    RunState::Skipped,
                     "job condition evaluated to false",
                 );
             }
@@ -716,7 +771,7 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
             shared.as_ref(),
             job,
             report,
-            "skipped",
+            RunState::Skipped,
             "dependency did not succeed",
         );
     }
@@ -776,27 +831,30 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
     if let Some(group) = lock {
         let _ = shared
             .db
-            .release_pipeline_lock(&group, &format!("{}/{}", shared.run_id, job.id));
+            .release_concurrency_slot(&group, &format!("{}/{}", shared.run_id, job.id));
     }
 
     report.steps = outcome.steps;
-    report.outputs = outcome.outputs;
-    report.error = outcome.error.map(|error| error.message);
+    report.summary_outputs = outcome.outputs.clone();
+    report.outputs = redact_map(&outcome.outputs, &shared.secret_redactions);
+    report.error = outcome
+        .error
+        .map(|error| crate::security::redact(&error.message, &shared.secret_redactions));
     report.status = if shared.cancel.is_cancelled() {
-        "cancelled".into()
+        RunState::Cancelled
     } else if outcome.job_failed || report.error.is_some() {
-        "failure".into()
+        RunState::Failed
     } else {
-        "success".into()
+        RunState::Succeeded
     };
-    report.conclusion = Some(report.status.clone());
+    report.conclusion = Some(report.status.as_str().into());
     report.finished_at = now_ms();
     report.duration_ms = report.finished_at.saturating_sub(started_at);
     let _ = persist_job(
         &shared.db,
         &shared.run_id,
         &job,
-        &report.status,
+        report.status,
         Some(started_at),
         Some(report.finished_at),
         &report.outputs,
@@ -813,8 +871,8 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
     shared.record_summary(
         &report.id,
         JobSummary {
-            status: report.status.clone(),
-            outputs: report.outputs.clone(),
+            status: report.status,
+            outputs: report.summary_outputs.clone(),
         },
     );
     drop(permit);
@@ -840,7 +898,7 @@ impl JobOutcome {
 }
 
 struct StepExecution {
-    status: String,
+    status: RunState,
     conclusion: Option<String>,
     exit_code: Option<i32>,
     duration_ms: u128,
@@ -854,7 +912,7 @@ struct StepExecution {
 impl StepExecution {
     fn ok() -> Self {
         Self {
-            status: "success".into(),
+            status: RunState::Succeeded,
             conclusion: Some("success".into()),
             exit_code: Some(0),
             duration_ms: 0,
@@ -868,7 +926,7 @@ impl StepExecution {
 
     fn failed(error: UbuilderError) -> Self {
         Self {
-            status: "failure".into(),
+            status: RunState::Failed,
             conclusion: Some("failure".into()),
             exit_code: None,
             duration_ms: 0,
@@ -882,7 +940,7 @@ impl StepExecution {
 
     fn cancelled() -> Self {
         Self {
-            status: "cancelled".into(),
+            status: RunState::Cancelled,
             conclusion: Some("cancelled".into()),
             exit_code: None,
             duration_ms: 0,
@@ -916,11 +974,12 @@ async fn execute_job_body(
         allowlist: crate::config::default_env_allowlist(),
         log_dir: Some(log_dir.to_path_buf()),
         verbose: shared.ui.verbose(),
-    });
+    })
+    .with_secrets(shared.secret_redactions.clone());
 
     for step in &job.steps {
         if shared.cancel.is_cancelled() {
-            let mut report = skipped_step(step, "cancelled");
+            let mut report = skipped_step(step, RunState::Cancelled);
             report.conclusion = Some("cancelled".into());
             persist_step(shared, job, report.clone());
             steps.push(report);
@@ -936,6 +995,7 @@ async fn execute_job_body(
             job_env,
             job_context,
             Some(job),
+            &shared.secret_values,
         );
         context.success = !job_failed;
         context.failure = job_failed;
@@ -981,7 +1041,7 @@ async fn execute_job_body(
             None => !job_failed,
         };
         if !should_run {
-            let report = skipped_step(step, "skipped");
+            let report = skipped_step(step, RunState::Skipped);
             persist_step(shared, job, report.clone());
             shared.events.step(
                 EventKind::StepSkipped,
@@ -1017,17 +1077,17 @@ async fn execute_job_body(
         )
         .await;
         execution.duration_ms = now_ms().saturating_sub(started);
-        if step.continue_on_error && execution.status == "failure" {
+        if step.continue_on_error && execution.status == RunState::Failed {
             execution.conclusion = Some("success".into());
         }
-        let failed = execution.status == "failure" || execution.status == "cancelled";
+        let failed = matches!(execution.status, RunState::Failed | RunState::Cancelled);
         if failed && !step.continue_on_error {
             job_failed = true;
         }
         let mut report = StepReport {
             id: step.id.clone(),
             name: step.name.clone(),
-            status: execution.status.clone(),
+            status: execution.status,
             conclusion: execution.conclusion.clone(),
             exit_code: execution.exit_code,
             duration_ms: execution.duration_ms,
@@ -1035,17 +1095,20 @@ async fn execute_job_body(
             outputs: execution.outputs.clone(),
             stdout_tail: execution.stdout_tail.clone(),
             stderr_tail: execution.stderr_tail.clone(),
-            error: execution.error.as_ref().map(|error| error.message.clone()),
+            error: execution
+                .error
+                .as_ref()
+                .map(|error| crate::security::redact(&error.message, &shared.secret_redactions)),
         };
         report.conclusion = Some(
             execution
                 .conclusion
                 .clone()
-                .unwrap_or_else(|| execution.status.clone()),
+                .unwrap_or_else(|| execution.status.as_str().into()),
         );
         persist_step(shared, job, report.clone());
         shared.events.step(
-            if report.status == "success" {
+            if report.status == RunState::Succeeded {
                 EventKind::StepFinish
             } else {
                 EventKind::Error
@@ -1096,6 +1159,7 @@ async fn execute_job_body(
             job_env,
             job_context,
             Some(job),
+            &shared.secret_values,
         );
         context.success = true;
         context.insert("workspace", json!(workspace.to_string_lossy()));
@@ -1201,7 +1265,10 @@ async fn run_step_with_retries(
                 .await
             }
         };
-        if result.status == "success" || attempt >= max_attempts || shared.cancel.is_cancelled() {
+        if result.status == RunState::Succeeded
+            || attempt >= max_attempts
+            || shared.cancel.is_cancelled()
+        {
             return result;
         }
         let delay = step
@@ -1229,7 +1296,7 @@ async fn run_step_once(
     job: &IrJob,
     step: &IrStep,
     workspace: &Path,
-    _log_dir: &Path,
+    log_dir: &Path,
     executor: &Executor,
     context: &Context,
     env: &IndexMap<String, String>,
@@ -1331,6 +1398,11 @@ async fn run_step_once(
             }
             let mut execution = StepExecution::ok();
             execution.outputs = outcome.outputs;
+            // Actions do not spawn a shell, but their message is still the
+            // step's observable output. Persist it like command output.
+            execution.stdout_tail =
+                crate::security::redact(&outcome.message, &shared.secret_redactions);
+            execution.log_path = write_action_log(log_dir, &step.id, &execution.stdout_tail);
             if let Some(hit) = execution.outputs.get("cache-hit") {
                 shared.events.step(
                     if hit == "true" {
@@ -1391,6 +1463,26 @@ async fn run_command(
     output_to_step(output, script)
 }
 
+fn write_action_log(log_dir: &Path, step_id: &str, message: &str) -> Option<PathBuf> {
+    if message.is_empty() {
+        return None;
+    }
+    std::fs::create_dir_all(log_dir).ok()?;
+    let name: String = step_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let path = log_dir.join(format!("{name}.log"));
+    std::fs::write(&path, format!("{message}\n")).ok()?;
+    Some(path)
+}
+
 fn output_to_step(output: ExecutionOutput, script: &str) -> StepExecution {
     let mut execution = StepExecution::ok();
     execution.duration_ms = output.duration_ms;
@@ -1399,21 +1491,21 @@ fn output_to_step(output: ExecutionOutput, script: &str) -> StepExecution {
     execution.stdout_tail = output.stdout_tail;
     execution.stderr_tail = output.stderr_tail;
     if output.timed_out {
-        execution.status = "failure".into();
+        execution.status = RunState::Failed;
         execution.conclusion = Some("failure".into());
         execution.error = Some(UbuilderError::new(
             ErrorCode::Timeout,
             "command exceeded its timeout",
         ));
     } else if output.cancelled {
-        execution.status = "cancelled".into();
+        execution.status = RunState::Cancelled;
         execution.conclusion = Some("cancelled".into());
         execution.error = Some(UbuilderError::new(
             ErrorCode::Cancelled,
             "command cancelled",
         ));
     } else if output.exit_code != Some(0) {
-        execution.status = "failure".into();
+        execution.status = RunState::Failed;
         execution.conclusion = Some("failure".into());
         execution.error = Some(
             UbuilderError::new(
@@ -1481,11 +1573,10 @@ async fn acquire_concurrency(
     let Some(group) = &policy.group else {
         return Ok(None);
     };
-    if policy.max.unwrap_or(1) > 1 {
-        return Ok(None);
-    }
+    let max = policy.max.unwrap_or(1).max(1);
     let owner = format!("{}/{}", shared.run_id, job.id);
     let mut announced = false;
+    let mut cancelled = std::collections::BTreeSet::new();
     loop {
         if shared.cancel.is_cancelled() {
             return Err(UbuilderError::new(
@@ -1495,9 +1586,32 @@ async fn acquire_concurrency(
         }
         if shared
             .db
-            .acquire_pipeline_lock(group, &owner, now_ms(), 3_600_000)?
+            .acquire_concurrency_slot(group, &owner, max, now_ms(), 3_600_000)?
+            .is_some()
         {
             return Ok(Some(group.clone()));
+        }
+        if policy.cancel_in_progress {
+            for peer in shared.db.concurrency_owners(group)? {
+                let run_id = peer.split('/').next().unwrap_or_default();
+                if run_id.is_empty()
+                    || run_id == shared.run_id
+                    || !cancelled.insert(run_id.to_string())
+                {
+                    continue;
+                }
+                let marker = crate::pipeline::history::cancel_marker(&shared.data_dir, run_id);
+                if let Some(parent) = marker.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&marker, b"cancel-in-progress");
+                shared.events.job(
+                    EventKind::Warning,
+                    &shared.run_id,
+                    &job.id,
+                    format!("cancelling run '{run_id}' holding concurrency group '{group}'"),
+                );
+            }
         }
         if !announced {
             announced = true;
@@ -1516,19 +1630,19 @@ fn finish_skipped(
     shared: &Shared,
     job: IrJob,
     mut report: JobReport,
-    status: &str,
+    status: RunState,
     reason: &str,
 ) -> JobReport {
-    report.status = status.into();
-    report.conclusion = Some(status.into());
+    report.status = status;
+    report.conclusion = Some(status.as_str().into());
     report.finished_at = now_ms();
     report.duration_ms = report.finished_at.saturating_sub(report.started_at);
     for step in &job.steps {
-        let step_report = skipped_step(step, "skipped");
+        let step_report = skipped_step(step, RunState::Skipped);
         persist_step(shared, &job, step_report.clone());
         report.steps.push(step_report);
     }
-    report.error = if status == "cancelled" {
+    report.error = if status == RunState::Cancelled {
         Some(reason.into())
     } else {
         None
@@ -1557,13 +1671,16 @@ fn fail_job_before_start(
     mut report: JobReport,
     error: UbuilderError,
 ) -> JobReport {
-    report.status = "failure".into();
+    report.status = RunState::Failed;
     report.conclusion = Some("failure".into());
-    report.error = Some(error.message.clone());
+    report.error = Some(crate::security::redact(
+        &error.message,
+        &shared.secret_redactions,
+    ));
     report.finished_at = now_ms();
     report.duration_ms = report.finished_at.saturating_sub(report.started_at);
     for step in &job.steps {
-        let step_report = skipped_step(step, "skipped");
+        let step_report = skipped_step(step, RunState::Skipped);
         persist_step(shared, &job, step_report.clone());
         report.steps.push(step_report);
     }
@@ -1571,7 +1688,7 @@ fn fail_job_before_start(
         &shared.db,
         &shared.run_id,
         &job,
-        "failure",
+        RunState::Failed,
         Some(report.started_at),
         Some(report.finished_at),
         &IndexMap::new(),
@@ -1580,12 +1697,12 @@ fn fail_job_before_start(
     report
 }
 
-fn skipped_step(step: &IrStep, status: &str) -> StepReport {
+fn skipped_step(step: &IrStep, status: RunState) -> StepReport {
     StepReport {
         id: step.id.clone(),
         name: step.name.clone(),
-        status: status.into(),
-        conclusion: Some(status.into()),
+        status,
+        conclusion: Some(status.as_str().into()),
         exit_code: None,
         duration_ms: 0,
         log_path: None,
@@ -1597,7 +1714,7 @@ fn skipped_step(step: &IrStep, status: &str) -> StepReport {
 }
 
 fn step_failure(step: &IrStep, error: UbuilderError) -> StepReport {
-    let mut report = skipped_step(step, "failure");
+    let mut report = skipped_step(step, RunState::Failed);
     report.error = Some(error.message);
     report
 }
@@ -1608,7 +1725,7 @@ fn cancelled_report(shared: &Shared, job: &IrJob) -> JobReport {
         id: job.id.clone(),
         base_id: job.base_id.clone(),
         name: job.name.clone(),
-        status: "queued".into(),
+        status: RunState::Pending,
         conclusion: None,
         started_at: started,
         finished_at: started,
@@ -1618,15 +1735,22 @@ fn cancelled_report(shared: &Shared, job: &IrJob) -> JobReport {
         steps: Vec::new(),
         outputs: IndexMap::new(),
         error: None,
+        summary_outputs: IndexMap::new(),
     };
-    finish_skipped(shared, job.clone(), report, "cancelled", "run cancelled")
+    finish_skipped(
+        shared,
+        job.clone(),
+        report,
+        RunState::Cancelled,
+        "run cancelled",
+    )
 }
 
 fn persist_job(
     db: &Db,
     run_id: &str,
     job: &IrJob,
-    status: &str,
+    status: RunState,
     started_at: Option<u128>,
     finished_at: Option<u128>,
     outputs: &IndexMap<String, String>,
@@ -1641,11 +1765,14 @@ fn persist_job(
         base_id: job.base_id.clone(),
         name: job.name.clone(),
         matrix_json: matrix,
-        status: status.into(),
-        conclusion: if matches!(status, "queued" | "running") {
+        status: status.as_str().into(),
+        conclusion: if matches!(
+            status,
+            RunState::Pending | RunState::Ready | RunState::Running
+        ) {
             None
         } else {
-            Some(status.into())
+            Some(status.as_str().into())
         },
         started_at,
         finished_at,
@@ -1660,7 +1787,7 @@ fn persist_step(shared: &Shared, job: &IrJob, report: StepReport) {
         job_id: job.id.clone(),
         step_id: report.id,
         name: report.name,
-        status: report.status,
+        status: report.status.as_str().into(),
         conclusion: report.conclusion,
         exit_code: report.exit_code,
         started_at: None,

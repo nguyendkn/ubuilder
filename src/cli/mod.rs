@@ -2,8 +2,10 @@
 //! real work to the library modules.
 
 mod build_cmd;
+mod daemon;
 mod maintenance;
 mod pipeline_cmd;
+mod secret_cmd;
 mod toolchains;
 
 use crate::builder::{self, BuildOptions, TargetBuildReport};
@@ -88,6 +90,21 @@ pub enum Command {
         #[command(subcommand)]
         command: maintenance::ArtifactCommand,
     },
+    /// Manage local secret values without printing them.
+    Secret {
+        #[command(subcommand)]
+        command: secret_cmd::SecretCommand,
+    },
+    /// Retention, garbage collection, pinning and storage statistics.
+    Maintenance {
+        #[command(subcommand)]
+        command: maintenance::MaintenanceCommand,
+    },
+    /// Git-polling and webhook trigger daemon.
+    Daemon {
+        #[command(subcommand)]
+        command: daemon::DaemonCommand,
+    },
     /// Declarative workflow pipeline.
     Pipeline {
         #[command(subcommand)]
@@ -149,6 +166,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
         Command::Toolchain { command } => toolchains::run(&cli, command, &ui),
         Command::Target { command } => maintenance::target(&cli, command, &ui),
         Command::Artifact { command } => maintenance::artifact(&cli, command, &ui),
+        Command::Secret { command } => secret_cmd::run(&cli, command, &ui),
+        Command::Maintenance { command } => maintenance::maintenance(&cli, command, &ui),
+        Command::Daemon { command } => daemon::run(&cli, command, &ui),
         Command::Pipeline { command } => pipeline_cmd::run(&cli, command, &ui, &cancel).await,
     }
 }
