@@ -120,12 +120,16 @@ is disclosed, not waived. Cold planning was not re-measured.
 
 ## 8. Release artifacts
 
-| File | Size | SHA-256 |
+| File | Size (bytes) | SHA-256 |
 | --- | ---: | --- |
-| `ubuilder-windows-x64.zip` | see `RELEASE_VERIFICATION.md` | see `RELEASE_VERIFICATION.md` |
-| `sbom.cdx.json` | see `RELEASE_VERIFICATION.md` | see `RELEASE_VERIFICATION.md` |
-| `release-manifest.json` | generated after packaging | covers archives and SBOM |
-| `SHA256SUMS` | generated last | covers every other file |
+| `ubuilder-windows-x64.zip` | 3,805,328 | `b63a6e45c3463c10ed6739f3b0fb3557601041cfe3eaae29c015549c5cd75864` |
+| `sbom.cdx.json` | 99,857 | `b3ba576aec19310f886f956aa51233accf809044044f5de977d533e5ead0cea2` |
+| `release-manifest.json` | 982 | `a662a537589cef0c2a134468eec93ccb8b3c0fe3f9d546cef07ef5687279cd40` |
+| `SHA256SUMS` | 262 | `88ee96447665aab5a34c85f51a310399f2fcad452f1a59d54c8697f82e8a7a79` |
+
+Artifact source commit is `bb2708c90440e014df74a32b8dd3bb5681b8e4b4`.
+Re-packaging into a fresh directory was byte-identical. Full verification:
+`RELEASE_VERIFICATION.md`.
 
 The extracted binary reports `ubuilder 0.1.0`; `--json doctor --all` exits 0
 with all seven targets; `target list --json` exits 0 with seven entries. Signing
