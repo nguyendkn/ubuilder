@@ -2,8 +2,8 @@
 
 **Ngày báo cáo:** 23/11/2026  
 **Dự án:** `C:/Users/gehihi/Documents/Projects/builder`  
-**Phạm vi:** Nâng cấp `ubuilder` từ công cụ build desktop đa nền tảng thành workflow engine CI/CD cục bộ, khai báo bằng YAML qua `ubuilder pipeline`.  
-**Trạng thái:** Hoàn thành phần triển khai, kiểm thử và tài liệu trên Windows x64. Legacy `build` / `package` / `release` vẫn hoạt động.
+**Phạm vi:** Nâng cấp `ubuilder` từ công cụ build desktop đa nền tảng thành workflow engine CI/CD cục bộ, khai báo bằng YAML qua `ubuilder pipeline`; bổ sung vận hành, bảo mật, phát hành và tài liệu production.  
+**Trạng thái:** `PRODUCTION_READY_WITH_LIMITATIONS` trên Windows x64. Legacy `build` / `package` / `release` vẫn hoạt động.
 
 ---
 
@@ -13,14 +13,17 @@
 
 Các kết quả chính:
 
-- 14 lệnh con `ubuilder pipeline` hoạt động, tất cả hỗ trợ `--json`.
+- 14 lệnh con `ubuilder pipeline` hoạt động, tất cả hỗ trợ `--json`; thêm nhóm lệnh `secret`, `maintenance` và `daemon`.
 - Workflow YAML có kiểm tra schema nghiêm ngặt, báo lỗi kèm dòng/cột.
 - Matrix jobs, sóng phụ thuộc (`needs`), workspace cô lập, artifacts, cache, retry, timeout, hủy chéo tiến trình và phục hồi run bị treo.
-- Lịch sử run/job/step lưu trong SQLite; có `status`, `logs`, `history`, `cancel`, `recover`.
-- **139 bài kiểm thử đều đạt**; `cargo fmt` và `cargo clippy -D warnings` sạch.
-- Tài liệu kiến trúc, DSL, IR, runtime, bảo mật, actions, ví dụ và trạng thái triển khai đã được viết.
-- CI cho Windows và Ubuntu; ví dụ workflow chạy được đã được thêm.
-- Mã nguồn đã được commit sạch trong Git.
+- Fail-fast không còn serialize matrix; concurrency group dùng slot có giới hạn; vòng đời run/job/step được kiểm tra bằng state machine.
+- Secret provider env/file, resolve fail-closed một lần mỗi run, redaction trên report/log/error/JSON.
+- Cache theo step, artifact được băm lại và xác minh; retention có `stats/prune/gc/pin/unpin`.
+- Action step lưu `stdout_tail` và log; daemon hỗ trợ polling, webhook loopback và chế độ `--once`.
+- **139 bài kiểm thử đều đạt**; `cargo fmt`, `cargo clippy -D warnings` và `cargo build --release` sạch.
+- Tài liệu kiến trúc, DSL, IR, runtime, bảo mật, actions, vận hành, phát hành và bộ `docs/production/` đã được viết.
+- CI cho Windows, Ubuntu và macOS; release workflow tạo archive, checksum và SBOM CycloneDX.
+- Mã nguồn đã được commit sạch trong Git tại `dc3de80`.
 
 ---
 
@@ -42,16 +45,24 @@ Các kết quả chính:
 
 Hệ quả: build Rust trên Windows vẫn thành công vì `rustc` tự tìm được linker nội bộ, nhưng `pipeline plan` phát cảnh báo `linker-unverified` cho mọi job. Các target chéo và macOS chưa thể kiểm chứng end-to-end trên máy này.
 
+Cross-build Linux đã được thử và dừng ở linker:
+
+```text
+error occurred in cc-rs: failed to find tool "x86_64-linux-gnu-gcc": program not found
+```
+
+Do đó báo cáo không tuyên bố có binary Linux hoặc macOS.
+
 ### 2.2 Cấu trúc mã nguồn
 
 Tại thời điểm báo cáo:
 
 | Hạng mục | Số lượng |
 | --- | --- |
-| Tệp được Git theo dõi | 111 (gồm báo cáo này) |
-| Tệp Rust | 82 |
-| Dòng Rust | khoảng 24.000 |
-| Tệp tài liệu Markdown | 11 |
+| Tệp được Git theo dõi | 133 |
+| Tệp Rust | 87 |
+| Dòng Rust | khoảng 26.800 |
+| Tệp tài liệu Markdown | 24 |
 | Bộ kiểm thử tích hợp | 5 |
 
 Các module chính:
@@ -77,7 +88,7 @@ src/security         containment, lọc env, redaction
 src/telemetry        output người đọc và JSON
 ```
 
-Tầng pipeline:
+Tầng pipeline và vận hành:
 
 ```text
 src/pipeline/parser       đọc YAML, giới hạn 1 MiB
@@ -86,15 +97,31 @@ src/pipeline/validator    kiểm tra ngữ nghĩa, gom diagnostics
 src/pipeline/compiler     schema → IR, topological sort, waves
 src/pipeline/matrix       Cartesian expansion + include/exclude
 src/pipeline/expression   lexer/parser/evaluator cho template và if
-src/pipeline/planner      phân giải capability của host
-src/pipeline/runtime      scheduler sóng, workspace, state machine
+src/pipeline/planner      phân giải capability của host, cache capability
+src/pipeline/runtime      scheduler sóng, workspace, fail-fast, concurrency
+src/pipeline/state        RunState, transition table, kiểm tra chuyển trạng thái
 src/pipeline/history      status/logs/cancel/recover
-src/pipeline/artifacts    content-addressed storage
-src/pipeline/cache        cache workspace
-src/pipeline/actions      11 built-in actions
+src/pipeline/artifacts    content-addressed storage, verify, containment
+src/pipeline/cache        cache workspace theo step
+src/pipeline/actions      11 built-in actions, action output
 src/pipeline/events       event tiến trình
 src/pipeline/graph        Mermaid / DOT / JSON
-src/cli/pipeline_cmd      CLI và JSON envelope
+src/secrets               env/file provider, SecretValue, redaction
+src/cli/pipeline_cmd      CLI pipeline và JSON envelope
+src/cli/secret_cmd        secret list/set/delete/inspect
+src/cli/maintenance       stats/prune/gc/pin/unpin
+src/cli/daemon            start/stop/status/run/trigger
+```
+
+Release và vận hành:
+
+```text
+scripts/package.py        archive tất định cho Windows/Linux/macOS
+scripts/checksums.py      SHA256SUMS từ đúng byte phát hành
+scripts/sbom.py           CycloneDX 1.5 từ cargo metadata --locked
+.github/workflows/ci.yml  fmt, clippy, test, release build trên 3 hệ điều hành
+.github/workflows/release.yml  build, SBOM, checksum, publish
+docs/production/          audit, threat model, risk, runbook, release, verdict
 ```
 
 ### 2.3 Hiện trạng kiểm thử ban đầu
@@ -126,7 +153,7 @@ Cài đặt cũ gán `combinations = additions`, nên chỉ còn các tổ hợp
 
 **Fail-fast**
 
-Với matrix có `fail-fast: true` và không đặt `max-parallel`, semaphore nội bộ được đặt giới hạn 1 để thứ tự lỗi xác định; các sibling chưa chạy được đánh dấu `skipped`. Trạng thái job được ghi vào summary **trước khi** nhả permit, tránh race với scheduler.
+Bản đầu tiên đặt semaphore nội bộ bằng 1 khi `fail-fast: true` và không có `max-parallel`, khiến các sibling chạy tuần tự. Đợt hardening đã bỏ giới hạn này: giới hạn là `job.max_parallel.unwrap_or(available_parallelism().max(2)).max(1)`. Fail-fast chỉ ngăn **lập lịch sibling mới**; sibling đang chạy được hoàn tất. Test `fail_fast_does_not_serialize_matrix_siblings` xác nhận hai job 2 giây hoàn thành dưới 4 giây.
 
 **Timeout và song song**
 
@@ -151,7 +178,30 @@ Compiler gọi `Target::parse("native")` và trả `UNSUPPORTED_TARGET`. Nay com
 - Checkout loại trừ `.git`, `target`, `node_modules`, `.ubuilder`, `dist`, `dist-smoke`.
 - Artifact lưu theo SHA-256, có manifest và kiểm tra tên an toàn.
 
-### 3.2 Bổ sung kiểm thử
+### 3.2 Hardening production
+
+| Hạng mục | Thay đổi | Kiểm chứng |
+| --- | --- | --- |
+| Secrets | `EnvironmentSecretProvider` và `FileSecretProvider`; `SecretValue` che giá trị khi Debug; file dùng lock, temp + rename, quyền `0600`/`0700` trên Unix | `missing_secret_fails_closed_before_running_jobs`, `secrets_are_injected_and_redacted_everywhere`, `secret_cli_never_prints_values` |
+| State machine | `RunState` 11 trạng thái; bảng chuyển trạng thái hợp lệ; validate trong transaction khi ghi run/job/step | `terminal_run_state_cannot_transition_back_to_running` |
+| Cache | Key = SHA-256 của `pipeline/v1/<host>\n<user_key>`, phạm vi step; workflow digest không còn làm mất cache | `cache_survives_unrelated_workflow_edits` |
+| Artifacts | Băm lại trước upload, verify object, staging trước publish, chặn symlink thoát khỏi root | Unit test artifact và `copy_tree_rejects_symlinks_escaping_the_root` (Unix) |
+| Concurrency | Bảng slot theo group; `cancel-in-progress` ghi cancel marker cho run khác đang giữ slot | `concurrency_group_serializes_jobs_without_deadlock` |
+| Retention | `maintenance stats/prune/gc/pin/unpin`; giữ run terminal mới nhất, bỏ qua run đang chạy, bảo vệ artifact được pin | `maintenance_prune_keeps_newest_runs_and_protects_active`, `maintenance_pin_protects_and_gc_removes_unreferenced_objects` |
+| Action output | `run_step_once` nhận log dir thật; lưu `stdout_tail` đã redact và `log_path` | `action_steps_capture_message_output` |
+| Hiệu năng | Cache facts toolchain 30 giây; planner cache capability theo target; thêm Criterion benchmark | `benches/pipeline.rs` |
+| Daemon | `daemon start/stop/status/run/trigger`; polling fingerprint, webhook loopback POST kèm token tùy chọn, chế độ `--once` | `daemon_once_runs_the_workflow_and_records_state`; kiểm tra thủ công webhook 401/405/202 |
+| Release | CI 3 hệ điều hành; release workflow tạo archive, checksum, SBOM, hook ký tùy chọn | `dist/` cục bộ đã verify |
+
+**Secrets.** Tên secret được trích từ IR và resolve đúng một lần trước job đầu tiên; thiếu tên nào thì run fail-closed. Giá trị thô chỉ nằm trong bộ nhớ để phục vụ `needs.*.outputs`; mọi bề mặt serialize đều dùng `***`. `secret set --value` vẫn lộ giá trị trong argv, nên khuyến nghị `--stdin` hoặc prompt.
+
+**State machine.** Các chuỗi cũ `queued`, `success`, `failure`, `timed_out`, `interrupted` vẫn được đọc để tương thích dữ liệu đã lưu, nhưng chuyển trạng thái không hợp lệ bị từ chối với `STATE_INVALID`.
+
+**Retention.** Prune xếp run mới nhất trước, chỉ xóa run terminal, không xóa run đang chạy. Pin bảo vệ artifact khỏi GC cho đến khi `unpin`.
+
+**Daemon.** Mỗi trigger được giao cho một tiến trình con `ubuilder pipeline run --file <workflow>` để chỉ có một runtime. Cron được giao cho scheduler của hệ điều hành; daemon không tạo scheduler thứ hai.
+
+### 3.3 Bổ sung kiểm thử
 
 Đã thêm các bài kiểm thử hành vi thực tế:
 
@@ -167,11 +217,21 @@ Compiler gọi `Target::parse("native")` và trả `UNSUPPORTED_TARGET`. Nay com
 | `independent_jobs_run_in_parallel` | Hai job độc lập chạy song song |
 | `two_jobs_transfer_artifacts_between_isolated_workspaces` | Upload ở job A, download ở job B với target `native` |
 | `step_timeout_fails_the_job` | Timeout thực sự kill process tree |
-| `cancel` / cross-process | Marker hủy được watcher 200 ms phát hiện |
+| `cancel_command_stops_a_running_workflow` | Hủy chéo tiến trình, run kết thúc `cancelled` |
+| `fail_fast_does_not_serialize_matrix_siblings` | Fail-fast giữ sibling chạy song song |
+| `secrets_are_injected_and_redacted_everywhere` | Secret đến command nhưng report/log/status chỉ có `***` |
+| `missing_secret_fails_closed_before_running_jobs` | Thiếu secret thì không job nào chạy |
+| `secret_cli_never_prints_values` | `secret set/list/inspect` không lộ giá trị |
+| `cache_survives_unrelated_workflow_edits` | Sửa job không liên quan không làm mất cache |
+| `concurrency_group_serializes_jobs_without_deadlock` | Slot tuần tự hóa, không deadlock |
+| `action_steps_capture_message_output` | Action step có output và log |
+| `maintenance_prune_keeps_newest_runs_and_protects_active` | Prune giữ run mới nhất, bỏ qua run active |
+| `maintenance_pin_protects_and_gc_removes_unreferenced_objects` | Pin bảo vệ artifact; GC chỉ xóa object không tham chiếu |
+| `daemon_once_runs_the_workflow_and_records_state` | Chế độ `--once` chạy workflow và ghi state |
 
 Ngoài ra, các helper test được làm cross-platform bằng `sleep_command`, `matrix_fail_fast_command`, `cache_fill_command`; test artifact dùng `native` thay vì target Windows cố định.
 
-### 3.3 Tài liệu
+### 3.4 Tài liệu
 
 Đã viết hoặc cập nhật:
 
@@ -189,11 +249,31 @@ Ngoài ra, các helper test được làm cross-platform bằng `sleep_command`,
 | `docs/PIPELINE_IMPLEMENTATION_STATUS.md` | Trạng thái đã kiểm chứng, phần chưa kiểm chứng |
 | `examples/native-matrix.yml` | Workflow mẫu chạy được với target native |
 
-Tài liệu ưu tiên **chỉ ghi điều đã kiểm chứng**. Các mục Linux/macOS, cross-compile và trigger được đánh dấu rõ là chưa chạy end-to-end.
+Bộ tài liệu production trong `docs/production/`:
 
-### 3.4 CI, ví dụ và vệ sinh repository
+| Tệp | Nội dung |
+| --- | --- |
+| `BASELINE_AUDIT.md` | Audit hiện trạng, lệnh và công cụ đo được |
+| `ARCHITECTURE_REVIEW.md` | Đánh giá kiến trúc, scheduler, storage, CLI |
+| `SECURITY_THREAT_MODEL.md` | Tài sản, tác nhân, biên tin cậy, rủi ro còn lại |
+| `RISK_REGISTER.md` | Rủi ro, mức độ, biện pháp và trạng thái |
+| `GAP_ANALYSIS.md` | Khoảng trống so với yêu cầu production |
+| `PRODUCTION_ROADMAP.md` | Phạm vi và thứ tự triển khai |
+| `CROSS_PLATFORM_MATRIX.md` | Bằng chứng Windows, Linux, macOS |
+| `PERFORMANCE_BASELINE.md` | Phương pháp đo và kết quả benchmark |
+| `SECURITY_TEST_REPORT.md` | Kiểm thử bảo mật và residual findings |
+| `RELEASE_PROCESS.md` | Gate, phiên bản, artifact, ký, SBOM |
+| `OPERATIONS_RUNBOOK.md` | Vận hành, chẩn đoán, retention, daemon |
+| `MIGRATION_GUIDE.md` | Tương thích legacy và dữ liệu cũ |
+| `FINAL_READINESS_REPORT.md` | Kết luận `PRODUCTION_READY_WITH_LIMITATIONS` |
 
-- `.github/workflows/ci.yml` chạy `fmt`, `clippy -D warnings`, `test --all-targets --locked` trên `windows-latest` và `ubuntu-latest`.
+Tài liệu ưu tiên **chỉ ghi điều đã kiểm chứng**. Các mục Linux/macOS, cross-compile, ký và dependency audit được đánh dấu rõ là chưa chạy end-to-end.
+
+### 3.5 CI, release, ví dụ và vệ sinh repository
+
+- `.github/workflows/ci.yml` chạy `fmt`, `clippy -D warnings`, `test --all-targets --locked` và `build --release --locked` trên `windows-latest`, `ubuntu-latest`, `macos-latest`.
+- `.github/workflows/release.yml` chạy khi tag `v*` hoặc dispatch; job `build` tạo archive từng nền tảng, job `sbom` tạo CycloneDX, job `publish` gộp checksum và phát hành.
+- `scripts/package.py` tạo archive tất định; `scripts/checksums.py` tạo `SHA256SUMS`; `scripts/sbom.py` tạo SBOM từ `cargo metadata --locked`.
 - Thêm workflow mẫu `examples/native-matrix.yml`; đã validate và plan thành công, cho ra ba sóng `test` → `build[target=native]` → `summary`.
 - Xóa các thư mục sinh tạm: `.tmp-pipeline`, `.tmp-e2e`, `dist-smoke`, `doctor.json`, `.tmp-ir.json`, `fixtures/*/target`, `fixtures/*/.ubuilder`, `fixtures/dotnet-console/{bin,obj}`.
 - Thu hẹp `.gitignore` để không bỏ sót mã nguồn tên `target` và tài nguyên `fixtures/tauri-app/dist`.
@@ -253,76 +333,148 @@ Giới hạn tài nguyên:
 | --- | --- |
 | `cargo fmt --all -- --check` | Đạt |
 | `cargo clippy --all-targets -- -D warnings` | Đạt, không cảnh báo |
-| `cargo test --all-targets --locked` | **121/121 đạt** |
+| `cargo test --all-targets --locked` | **139/139 đạt**, 102,34 giây |
+| `cargo build --release --locked` | Đạt |
 
 ### 5.2 Phân bố kiểm thử
 
 | Bộ kiểm thử | Số bài | Kết quả |
 | --- | ---: | --- |
-| Unit test thư viện | 92 | Đạt |
-| `tests/cli.rs` | 6 | Đạt |
+| Unit test thư viện | 100 | Đạt |
 | `tests/builds.rs` | 1 | Đạt |
+| `tests/cli.rs` | 6 | Đạt |
 | `tests/compatibility.rs` | 2 | Đạt |
 | `tests/pipeline_contract.rs` | 7 | Đạt |
-| `tests/pipeline_runtime.rs` | 13 | Đạt |
-| **Tổng** | **121** | **Đạt** |
+| `tests/pipeline_runtime.rs` | 23 | Đạt |
+| **Tổng** | **139** | **Đạt** |
 
-### 5.3 Kiểm chứng thủ công
+### 5.3 Benchmark
+
+Đo bằng `benches/pipeline.rs` (Criterion), workflow 12 job với matrix 4 tổ hợp, tổng 48 job:
+
+| Benchmark | Kết quả |
+| --- | ---: |
+| Parse + validate | 234,69 µs |
+| Compile + expand | 403,61 µs |
+| Plan 48 job, warm | 71,31 ms |
+| Plan 48 job, cold | khoảng 4,5 s |
+
+Cold plan chậm do probe toolchain; facts được cache 30 giây trong cùng tiến trình.
+
+### 5.4 Kiểm chứng thủ công
 
 - `pipeline validate` trên `examples/native-matrix.yml`: không có diagnostic.
 - `pipeline plan`: đúng ba sóng, id `test`, `build[target=native]`, `summary`; cảnh báo `linker-unverified` đúng với môi trường thiếu linker.
 - Chạy workflow thật trên fixture Rust: build, package, upload/download artifact, checksum, cache, retry, timeout, cancel, recover đều cho kết quả đúng.
 - JSON envelope: thành công `{"ok":true,...}`; lỗi có `code`, `message`, `remediation`, `details`.
 - Exit code: `0` thành công, `1` lỗi thực thi, `2` usage, `3` cấu hình/toolchain, `130` bị hủy.
+- Daemon: `start` → `status` running → `stop` → `status` không còn pid; webhook trả `401` khi thiếu token, `405` khi sai method, `202` khi hợp lệ và run hoàn tất.
+- Release binary `dist/ubuilder.exe --version` trả `ubuilder 0.1.0`; `doctor --json` trả envelope hợp lệ.
+- `sha256sum -c dist/SHA256SUMS`: cả `ubuilder-windows-x64.zip` và `sbom.cdx.json` đều OK.
+
+Artifact phát hành cục bộ:
+
+| Tệp | Kích thước | SHA-256 |
+| --- | ---: | --- |
+| `ubuilder-windows-x64.zip` | 3,6 MiB | `7b18aca911391849b3de0035ee1173be76b9ceab14d3972fdbc81c9eb911b65a` |
+| `sbom.cdx.json` | 98 KiB | `b3ba576aec19310f886f956aa51233accf809044044f5de977d533e5ead0cea2` |
+
+Archive có 24 entry và chứa `ubuilder.exe`. SBOM là CycloneDX 1.5 với 168 component và 168 dependency node. `dist/` được ignore, không commit.
+
+### 5.5 Bằng chứng đa nền tảng
+
+| Nền tảng | Build | Test | Fixture native | Bằng chứng |
+| --- | --- | --- | --- | --- |
+| Windows x64 | Đạt | 139/139 | Đạt | Máy hiện tại |
+| Linux x64 | **Chưa xác minh** | CI đã cấu hình | Chưa chạy | Cross build thiếu `x86_64-linux-gnu-gcc` |
+| macOS | **Chưa xác minh** | CI đã cấu hình | Chưa chạy | Không có host/SDK; CI chưa chạy thực tế |
+
+Không có binary Linux hoặc macOS nào được tuyên bố trong báo cáo này.
 
 ---
 
-## 6. Hạn chế, rủi ro và trạng thái xử lý
+## 6. Bảo mật
 
-| Hạn chế | Mức độ | Ghi chú |
+| Kiểm soát | Bằng chứng |
+| --- | --- |
+| Secret chỉ resolve tên được tham chiếu, fail-closed trước job đầu tiên | `missing_secret_fails_closed_before_running_jobs` |
+| Secret đến command nhưng bị redact ở report, output, status và JSON | `secrets_are_injected_and_redacted_everywhere` |
+| CLI secret không in giá trị thô | `secret_cli_never_prints_values` |
+| Artifact được băm lại, manifest được xác minh | Unit test artifact và build fixture |
+| Chặn ZIP traversal | `cache::tests::extraction_rejects_traversal_entries` |
+| Chặn symlink thoát khỏi root | `copy_tree_rejects_symlinks_escaping_the_root` (`cfg(unix)`) |
+| Run terminal không quay lại `running` | `storage::tests::terminal_run_state_cannot_transition_back_to_running` |
+| Retention không xóa run active hoặc artifact được pin | Hai integration test maintenance |
+| Webhook chỉ loopback, POST, token tùy chọn | Kiểm tra thủ công `401` / `405` / `202` |
+
+Residual findings:
+
+- Workspace là ranh giới thư mục, không phải OS sandbox; workflow tin cậy chạy với quyền người dùng.
+- File secret trên Windows dựa vào ACL kế thừa; trên Unix được đặt `0600` và thư mục `0700`.
+- `secret set --value` lộ giá trị trong argv; dùng `--stdin` hoặc prompt.
+- Webhook không có TLS, rate limit hoặc replay window; chỉ dùng loopback.
+- Chưa chạy `cargo-audit` / `cargo-deny`; SBOM là inventory, không phải vulnerability scan.
+- Chưa có code signing, macOS notarization hoặc release công khai.
+
+---
+
+## 7. Hạn chế và rủi ro còn lại
+
+| Hạn chế | Mức độ | Trạng thái / ghi chú |
 | --- | --- | --- |
-| Linux chưa chạy end-to-end trên máy này | Trung bình | CI đã cấu hình Ubuntu nhưng chưa thực thi trong môi trường hiện tại |
-| macOS chưa kiểm chứng | Trung bình | Thiếu SDK/công cụ; plan báo capability thay vì giả thành công |
-| Cross-compile phụ thuộc linker/SDK | Trung bình | Target không khả dụng được báo lỗi rõ ràng |
-| `container` / `wsl` backend chưa cài đặt | Thấp | Planner từ chối kèm remediation |
-| Trigger | Thấp | Daemon polling Git/workflow + webhook loopback; cron do OS scheduler |
-| `cancel-in-progress` | Thấp | Đã triển khai qua cancel marker; chưa có test riêng |
-| Secret store | Đã xử lý | Env/file provider, resolve fail-closed, redaction; không có keychain |
-| Retention | Đã xử lý | `maintenance stats/prune/gc/pin/unpin`; pin bảo vệ artifact |
-| Action step stdout | Đã xử lý | Message được lưu vào output và log |
-| Cache | Đã xử lý | Key theo step, không phụ thuộc digest toàn workflow |
-| Fail-fast | Đã xử lý | Không serialize matrix; sibling đang chạy được hoàn tất |
-| Sandbox OS | Trung bình | Workspace chỉ là ranh giới thư mục, không phải sandbox bảo mật |
+| Linux chưa chạy end-to-end | Trung bình | CI đã cấu hình Ubuntu; cross build thiếu linker |
+| macOS chưa kiểm chứng | Trung bình | Không có host/SDK; CI chưa chạy thực tế |
+| Cross-compile phụ thuộc linker/SDK | Trung bình | Báo `linker-unverified`, không giả thành công |
+| OS sandbox | Trung bình | Chưa có `IsolationProvider`; workflow không tin cậy chưa được cô lập |
+| Dependency audit | Trung bình | `cargo-audit` / `cargo-deny` chưa cài; SBOM đã có |
+| Ký và notarization | Trung bình | Chỉ có hook `UBUILDER_SIGN_COMMAND`; chưa có credential |
+| CI/release chưa chạy thật | Trung bình | Workflow đã viết nhưng chưa được GitHub Actions thực thi |
+| Daemon start/stop/webhook | Thấp | Webhook kiểm tra thủ công; chỉ `--once` có test tự động |
+| `cancel-in-progress` | Thấp | Dùng cancel marker; chưa có test riêng |
+| Concurrency slot sau crash | Thấp | Thu hồi bằng lease 1 giờ, chưa có heartbeat |
+| SQLite schema mới hơn | Thấp | Chưa từ chối version cao hơn |
+| Action từ xa, container/WSL, installer native | Thấp | Chưa triển khai; planner báo capability |
 
-Rủi ro vận hành chính: pipeline chạy lệnh tùy ý với quyền người dùng, không phải sandbox bảo mật. Workspace cô lập ngăn ghi đè giữa job nhưng không ngăn tiến trình cố ý ghi ra ngoài.
-
----
-
-## 7. Đề xuất tiếp theo
-
-1. **Chạy CI thực tế trên Ubuntu và macOS** để xác nhận Linux/macOS end-to-end.
-2. **Thêm integration test cho `setup-rust` / `setup-dotnet` / `setup-node` và `verify`**, hiện mới được phủ qua unit/legacy.
-3. **Kiểm thử cross-compile có điều kiện** khi linker/SDK tồn tại; giữ hành vi báo lỗi rõ ràng khi thiếu.
-4. **Bổ sung OS sandbox** cho workflow không tin cậy (container/WSL hoặc Job Object).
-5. **Thêm dependency audit** (`cargo-audit`/`cargo-deny`) vào CI cùng SBOM.
-6. **Kiểm thử daemon start/stop/webhook** trong CI và thêm TLS reverse-proxy guidance.
-7. **Thêm heartbeat cho concurrency slot** để thu hồi sớm sau crash thay vì chờ lease 1 giờ.
+Rủi ro vận hành chính: pipeline chạy lệnh tùy ý với quyền người dùng. Workspace cô lập ngăn ghi đè giữa job nhưng không ngăn tiến trình cố ý ghi ra ngoài. Với workflow không tin cậy, cần OS sandbox trước khi dùng production.
 
 ---
 
-## 8. Commit
+## 8. Đề xuất tiếp theo
+
+1. **Chạy CI thực tế trên Ubuntu và macOS** để xác nhận Linux/macOS end-to-end và chạy test symlink `cfg(unix)`.
+2. **Chạy release workflow bằng tag thử** để xác nhận archive, checksum, SBOM và publish trên GitHub.
+3. **Thêm dependency audit** (`cargo-audit`/`cargo-deny`) vào CI cùng SBOM.
+4. **Bổ sung OS sandbox** cho workflow không tin cậy: container/WSL, Windows Job Object hoặc backend tương đương.
+5. **Thêm signing/notarization thật** cho Windows và macOS; công bố artifact kèm chữ ký kiểm chứng được.
+6. **Tự động hóa test daemon** `start/stop/webhook` trong CI, kèm TLS reverse-proxy guidance.
+7. **Thêm test riêng cho `cancel-in-progress`** giữa hai run thực sự chạy song song.
+8. **Thêm heartbeat cho concurrency slot** để thu hồi sớm sau crash thay vì chờ lease 1 giờ.
+9. **Từ chối SQLite schema mới hơn** và bổ sung migration/rollback có kiểm thử.
+10. **Kiểm thử cross-compile có điều kiện** khi linker/SDK tồn tại; giữ hành vi báo lỗi rõ ràng khi thiếu.
+
+---
+
+## 9. Commit
 
 | Commit | Nội dung |
 | --- | --- |
-| `81fa5e5` | `feat: add local-first declarative pipeline engine` — toàn bộ engine, action, test, tài liệu, CI |
-| `aa17665` | `fix: track target module and Tauri fixture assets` — sửa `.gitignore`, bổ sung `src/target/mod.rs` và fixture Tauri |
+| `81fa5e5` | `feat: add local-first declarative pipeline engine` — engine, action, test, tài liệu, CI |
+| `aa17665` | `fix: track target module and Tauri fixture assets` — sửa `.gitignore`, bổ sung module và fixture |
+| `73bfc31` | `docs: add Vietnamese implementation report` — báo cáo triển khai ban đầu |
+| `dc3de80` | `feat: production hardening for pipeline engine` — fail-fast, secrets, state, cache, artifacts, retention, daemon, benchmark, release và docs production |
 
-Repository hiện sạch; các thư mục còn lại chỉ là output sinh tự động đã được ignore.
+Báo cáo này được cập nhật sau `dc3de80`. Sau khi commit tài liệu, repository sạch; `dist/` và các thư mục sinh tự động vẫn được ignore.
 
 ---
 
-## 9. Kết luận
+## 10. Kết luận
 
-Tầng pipeline đã đạt mục tiêu: khai báo bằng YAML, thực thi cục bộ có cô lập, tái sử dụng engine build sẵn có, lưu lịch sử và báo cáo có cấu trúc. Legacy build không bị ảnh hưởng. Chất lượng được chứng minh bằng 139 bài kiểm thử, clippy sạch và các lần chạy workflow thật trên Windows x64.
+Tầng pipeline đã đạt mục tiêu: khai báo bằng YAML, thực thi cục bộ có cô lập, tái sử dụng engine build sẵn có, lưu lịch sử và báo cáo có cấu trúc. Legacy build không bị ảnh hưởng.
 
-Phần còn thiếu chủ yếu là kiểm chứng đa nền tảng thực tế, OS sandbox và dependency audit. Những mục này đã được ghi rõ trong tài liệu trạng thái thay vì tuyên bố quá mức.
+Trên Windows x64, các gate đã chạy thật:
+
+- 139/139 bài kiểm thử đạt.
+- `fmt`, `clippy -D warnings`, `build --release` đạt.
+- Benchmark có số đo cụ thể; release artifact và checksum đã được xác minh.
+
+Kết luận: **`PRODUCTION_READY_WITH_LIMITATIONS`**. Chưa thể tuyên bố `PRODUCTION_READY` đầy đủ vì Linux/macOS chưa chạy thật, dependency audit và OS sandbox chưa có, signing/notarization chưa có credential, và GitHub Actions chưa thực thi trong môi trường này. Mọi giới hạn đều được nêu rõ thay vì tuyên bố quá mức.
