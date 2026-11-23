@@ -24,15 +24,17 @@ def add_files(entries):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--platform", required=True, choices=["windows", "linux", "macos"])
+    parser.add_argument("--arch", default=None, choices=["x64", "arm64"])
     parser.add_argument("--output", default="dist")
     parser.add_argument("--binary", default=None)
     args = parser.parse_args()
     binary = Path(args.binary or ("target/release/ubuilder.exe" if args.platform == "windows" else "target/release/ubuilder"))
     if not binary.is_file():
         raise SystemExit(f"missing release binary: {binary}")
+    arch = args.arch or ("arm64" if args.platform == "macos" else "x64")
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
-    name = {"windows": "ubuilder-windows-x64.zip", "linux": "ubuilder-linux-x64.tar.gz", "macos": "ubuilder-macos.tar.gz"}[args.platform]
+    name = f"ubuilder-{args.platform}-{arch}.{'zip' if args.platform == 'windows' else 'tar.gz'}"
     archive = out / name
     entries = add_files([])
     entries.insert(0, (binary, "ubuilder.exe" if args.platform == "windows" else "ubuilder"))

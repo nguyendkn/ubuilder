@@ -1,61 +1,85 @@
 # Security test report
 
-Date: 2026-11-23. Host: Windows x64. Command:
+Date: 2026-11-23. Host: Windows 10.0.26300 x64. Command:
 `cargo test --all-targets --locked`.
+
+Only Windows x64 executed. Unix-only tests are compiled but not claimed as
+executed; Linux/macOS evidence is BLOCKED.
 
 ## Result summary
 
 | Suite | Tests | Result |
 | --- | ---: | --- |
-| Library unit tests | 100 | pass |
-| `tests/builds.rs` | 1 | pass |
+| Library unit tests | 123 | pass |
+| `src/main.rs` | 0 | pass |
+| `tests/builds.rs` | 2 | pass |
 | `tests/cli.rs` | 6 | pass |
-| `tests/compatibility.rs` | 2 | pass |
+| `tests/compatibility.rs` | 3 | pass |
+| `tests/daemon.rs` | 4 | pass |
 | `tests/pipeline_contract.rs` | 7 | pass |
-| `tests/pipeline_runtime.rs` | 23 | pass |
-| **Total** | **139** | **pass** |
+| `tests/pipeline_runtime.rs` | 27 | pass |
+| **Total** | **172** | **pass** |
 
-The suite was rerun after the final state-machine and maintenance changes. The
-symlink-escape unit test is `#[cfg(unix)]` and therefore does not execute on the
-Windows host; it is expected to run in Linux/macOS CI.
+Machine-readable log: `target/finalization-final.log`.
+`cargo fmt --all -- --check` and
+`cargo clippy --all-targets --locked -- -D warnings` pass.
 
 ## Security-specific evidence
 
 | Control | Test | What it proves |
 | --- | --- | --- |
-| Secret masking | `secrets_are_injected_and_redacted_everywhere` | Values reach commands, while report outputs, errors, stdout tail and status JSON contain only `***`. |
-| Fail-closed resolution | `missing_secret_fails_closed_before_running_jobs` | No job starts when a referenced secret is missing; exit code and remediation are correct. |
-| CLI confidentiality | `secret_cli_never_prints_values` | `secret list/set/inspect` JSON and human output never contain the raw value. |
-| Artifact integrity | `artifacts::tests::hash_is_stable_and_content_sensitive`, `builds::rust_fixture_builds...` | Content hashing is deterministic and the produced artifact validates. |
-| Symlink escape | `copy_tree_rejects_symlinks_escaping_the_root` (`cfg(unix)`) | A link resolving outside the packaged root is rejected. |
-| ZIP traversal | `cache::tests::extraction_rejects_traversal_entries` | Entries whose normalized path escapes the destination are rejected before write. |
-| Cache corruption | `cache::tests::tree_roundtrip_and_corruption_detection` | A tampered blob fails the hash check instead of being served. |
-| Lifecycle integrity | `storage::tests::terminal_run_state_cannot_transition_back_to_running` | A terminal run cannot be moved back to `running`; error code is `STATE_INVALID`. |
-| Retention safety | `maintenance_prune_keeps_newest_runs_and_protects_active`, `maintenance_pin_protects_and_gc_removes_unreferenced_objects` | Active/pinned data is not deleted; GC deletes only unreferenced objects. |
-| Cancellation | `cancel_command_stops_a_running_workflow` | Cross-process cancellation terminates work and reports `cancelled`/130. |
+| Per-job secret scope | `runtime::tests::secret_scope_only_contains_names_the_job_references` | A job receives only referenced names; unrelated resolved secrets do not enter its context. |
+| Secret redaction | `secrets_are_injected_and_redacted_everywhere` | Values reach commands, while reports, errors, stdout tails and JSON contain only the redaction marker. |
+| Fail-closed resolution | `missing_secret_fails_closed_before_running_jobs` | No job starts when a referenced secret is missing. |
+| CLI confidentiality | `secret_cli_never_prints_values` | `secret list/set/inspect` output never contains the raw value. |
+| Windows secret ACL | `secrets::tests::windows_secret_file_has_no_inherited_aces` | Inheritance is removed and only the current user retains full control. |
+| Artifact integrity | `pipeline::artifacts::tests::corrupted_artifact_object_is_rejected_on_download` | A tampered immutable object fails re-hash and returns `ARTIFACT_INVALID`. |
+| Junction escape | `pipeline::artifacts::tests::junction_escape_is_rejected` | A junction resolving outside the workspace is rejected. |
+| Lexical traversal | `security::tests::rejects_traversal_and_absolute_paths`, `pipeline::validator::tests::rejects_step_path_escape`, `pipeline::artifacts::tests::lexical_containment_rejects_absolute_and_parent_paths` | `..`, absolute and drive paths are rejected. |
+| Symlink escape (Unix) | `pipeline::artifacts::tests::symlink_escape_is_rejected` | Compiled on Windows but not executed; Linux/macOS evidence is BLOCKED. |
+| ZIP traversal | `cache::tests::extraction_rejects_traversal_entries` | Escaping entries are rejected before write. |
+| Cache corruption | `cache::tests::tree_roundtrip_and_corruption_detection`, `pipeline::cache::tests::corrupt_entry_is_not_restored` | A tampered entry fails its hash and is not served. |
+| Cache poisoning isolation | `pipeline::cache::tests::identity_layers_change_the_key` | Host/toolchain/namespace/job identity changes the key. |
+| Stale lease fencing | `storage::tests::expired_lease_cannot_be_renewed_or_released_by_the_old_owner` | An expired owner cannot renew or release a slot owned by a newer generation. |
+| Newer schema | `storage::tests::newer_schema_is_rejected_before_ddl` | `SCHEMA_UNSUPPORTED` is returned before mutation. |
+| Isolation fail-closed | `isolated_mode_fails_closed_without_a_backend` | Exit 3, `SECURITY_CAPABILITY_UNAVAILABLE`, no run record, no native fallback. |
+| Webhook auth | `tests/daemon.rs::webhook_requires_configuration_and_authenticates_requests` | Missing token config is `CONFIG_INVALID`; wrong token is 401; duplicate delivery is 409; valid is 202. |
+| Webhook token storage | `tests/daemon.rs::daemon_child_receives_webhook_token_only_through_the_environment` | The detached child's command line does not contain the token. |
+| Rate limiting / constant time | `cli::daemon::tests::rate_limit_and_constant_time_comparison` | The limiter returns 429 and comparison does not short-circuit on content. |
+| Body/header limits | `cli::daemon::tests` and `serve()` | 16 KiB headers, 64 KiB body, 5 s socket timeouts, 413 on oversized body. |
+| Cancellation | `cancel_command_stops_a_running_workflow` | Cross-process cancellation terminates work and reports cancelled/130. |
+| Cancel-in-progress | `cancel_in_progress_cancels_the_holder_and_releases_its_lease` | Holder is cancelled, relinquishes its lease, and the contender succeeds. |
+| Retention safety | `maintenance_prune_keeps_newest_runs_and_protects_active`, `maintenance_pin_protects_and_gc_removes_unreferenced_objects` | Active/pinned data is not deleted; GC removes only unreferenced objects. |
+
+The complete adversarial case list, including BLOCKED cases, is
+`docs/production/adversarial-matrix.json` (16 PASS, 2 BLOCKED).
 
 ## Manual verification
 
-- `ubuilder secret set` via stdin; `secret inspect` displayed `***` and a
-  provider name, not the value.
-- `ubuilder maintenance gc` removed one unreferenced object and left pinned
-  objects intact (covered by the integration test above).
-- `python scripts/sbom.py` emitted 168 components and 168 dependency nodes; the
-  document parses as JSON.
+- `ubuilder secret set NAME --stdin`; `secret inspect` displayed metadata, not
+  the value.
+- `python scripts/sbom.py` emitted CycloneDX with the locked dependency graph;
+  the document parses as JSON.
+- `.NET` fixture built, packaged and executed from the extracted archive; see
+  `RELEASE_VERIFICATION.md` for the release smoke test.
 
 ## Dependency audit
 
-Not executed: `cargo-audit` and `cargo-deny` are not installed and no network
-audit database was queried. The SBOM is an inventory, not a vulnerability scan.
-This gate is BLOCKED and the verdict does not claim a clean vulnerability scan.
+Not executed: `cargo-audit` and `cargo-deny` are absent and no advisory database
+was queried. CI defines `rustsec/audit-check@v2`, but CI has not run in this
+environment. This gate is BLOCKED; no clean vulnerability scan is claimed.
 
 ## Residual findings
 
-1. Workspace isolation is not an OS sandbox.
-2. Webhook is plaintext loopback with an optional bearer token.
-3. Windows secret-file permissions rely on inherited ACLs.
-4. `secret set --value` exposes the value in argv.
-5. No TLS, rate limiting or replay window on the daemon webhook.
-
-None of these is a known exploitable defect in the default local, trusted-user
-deployment, but each is disclosed in the threat model and risk register.
+1. No verified OS sandbox on Windows; `trusted-native` is the default and
+   requires trusted workflows. Windows Job Objects are not claimed as a complete
+   filesystem/network sandbox.
+2. Webhook transport is plaintext and loopback by default; TLS is external.
+3. Only 16 KiB/64 KiB limits and a fixed 60/60 s rate window are enforced; there
+   is no adaptive or per-IP limiting.
+4. Replay protection is bounded to 1024 delivery ids in memory; it is not
+   durable across daemon restarts.
+5. `secret set --value` remains available (deprecated) for compatibility.
+6. Unix ACL/mode and symlink behavior is implemented but not executed here.
+7. No signature or notarization was verified.
+8. No disk-full, SQLite-busy, or artifact-publication crash injection was run.

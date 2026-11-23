@@ -9,6 +9,32 @@ const ALL: &str =
 const LEVELS: [&str; 4] = ["SUPPORTED", "CONDITIONAL", "EXPERIMENTAL", "UNSUPPORTED"];
 
 #[test]
+fn doctor_all_matches_the_explicit_target_list() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ubuilder"))
+        .args(["doctor", "--all", "--json"])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let ids: Vec<&str> = json["data"]["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|target| target["target"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        ALL.split(',').collect::<Vec<_>>(),
+        "--all must diagnose every canonical target"
+    );
+}
+
+#[test]
 fn capability_matrix_is_explicit_and_unsupported_has_reasons() {
     let output = Command::new(env!("CARGO_BIN_EXE_ubuilder"))
         .args(["doctor", "--target", ALL, "--json"])

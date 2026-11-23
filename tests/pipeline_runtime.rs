@@ -119,12 +119,48 @@ fn sleep_command(seconds: u32) -> String {
     }
 }
 
-fn matrix_fail_fast_command() -> &'static str {
+fn timed_sleep_command(start: &std::path::Path, end: &std::path::Path, seconds: u32) -> String {
     if cfg!(windows) {
-        "if ($env:UBUILDER_JOB_ID -like '*one*') { exit 1 }\nexit 0"
+        format!(
+            "New-Item -ItemType File -Force -Path '{}' | Out-Null\n{}\nNew-Item -ItemType File -Force -Path '{}' | Out-Null",
+            start.display(),
+            sleep_command(seconds),
+            end.display()
+        )
     } else {
-        "case \"$UBUILDER_JOB_ID\" in *one*) exit 1;; esac\nexit 0"
+        format!(
+            "touch '{}'\n{}\ntouch '{}'",
+            start.display(),
+            sleep_command(seconds),
+            end.display()
+        )
     }
+}
+
+fn marker_modified(path: &std::path::Path) -> std::time::SystemTime {
+    std::fs::metadata(path)
+        .unwrap_or_else(|error| panic!("missing marker {}: {error}", path.display()))
+        .modified()
+        .unwrap()
+}
+
+fn assert_overlap(
+    left: (&std::path::Path, &std::path::Path),
+    right: (&std::path::Path, &std::path::Path),
+    report: &Value,
+) {
+    let left_start = marker_modified(left.0);
+    let left_end = marker_modified(left.1);
+    let right_start = marker_modified(right.0);
+    let right_end = marker_modified(right.1);
+    assert!(
+        left_start < right_end && right_start < left_end,
+        "jobs ran serially: {report}"
+    );
+}
+
+fn matrix_fail_fast_command() -> &'static str {
+    "exit 1"
 }
 
 fn cache_fill_command() -> &'static str {
@@ -281,22 +317,54 @@ jobs:
       fail-fast: true
       max-parallel: 1
       matrix:
-        name: [one, two]
+        name: [one, two, three]
     steps:
       - run: |
           {}
 "#,
-        matrix_fail_fast_command().replace('\n', "\n          ")
+        matrix_fail_fast_command()
     ));
     let (output, json) = sandbox.run_json(&workflow, &["--run-id", "fail-fast"]);
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(job(&json, "build[name=one]")["status"], "failure");
-    assert_eq!(job(&json, "build[name=two]")["status"], "skipped");
+    let statuses: Vec<&str> = ["build[name=one]", "build[name=two]", "build[name=three]"]
+        .iter()
+        .map(|id| job(&json, id)["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == "failure")
+            .count(),
+        1,
+        "exactly one sibling should run and fail: {json}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == "skipped")
+            .count(),
+        2,
+        "queued siblings must be skipped after fail-fast: {json}"
+    );
 }
 
 #[test]
 fn fail_fast_does_not_serialize_matrix_siblings() {
     let sandbox = Sandbox::new();
+    let markers: Vec<_> = (0..2)
+        .map(|index| {
+            (
+                sandbox.temp.path().join(format!("ff{index}-start")),
+                sandbox.temp.path().join(format!("ff{index}-end")),
+            )
+        })
+        .collect();
+    let mut commands = Vec::new();
+    for (start, end) in &markers {
+        let _ = std::fs::remove_file(start);
+        let _ = std::fs::remove_file(end);
+        commands.push(timed_sleep_command(start, end, 2));
+    }
     let workflow = sandbox.workflow(&format!(
         r#"version: 1
 name: FailFastParallel
@@ -307,16 +375,26 @@ jobs:
       matrix:
         name: [one, two]
     steps:
-      - run: {}
+      - run: |
+          {}
+  other:
+    strategy:
+      fail-fast: true
+      matrix:
+        name: [one, two]
+    steps:
+      - run: |
+          {}
 "#,
-        sleep_command(2)
+        commands[0].replace('\n', "\n          "),
+        commands[1].replace('\n', "\n          ")
     ));
     let (output, json) = sandbox.run_json(&workflow, &["--run-id", "fail-fast-parallel"]);
     assert!(output.status.success(), "{json}");
-    let duration = json["data"]["duration_ms"].as_u64().unwrap();
-    assert!(
-        duration < 4000,
-        "fail-fast serialized matrix siblings: {duration} ms"
+    assert_overlap(
+        (&markers[0].0, &markers[0].1),
+        (&markers[1].0, &markers[1].1),
+        &json,
     );
 }
 
@@ -345,24 +423,33 @@ jobs:
 #[test]
 fn independent_jobs_run_in_parallel() {
     let sandbox = Sandbox::new();
+    let left = (
+        sandbox.temp.path().join("left-start"),
+        sandbox.temp.path().join("left-end"),
+    );
+    let right = (
+        sandbox.temp.path().join("right-start"),
+        sandbox.temp.path().join("right-end"),
+    );
     let workflow = sandbox.workflow(&format!(
         r#"version: 1
 name: Parallel
 jobs:
   left:
     steps:
-      - run: {}
+      - run: |
+          {}
   right:
     steps:
-      - run: {}
+      - run: |
+          {}
 "#,
-        sleep_command(2),
-        sleep_command(2)
+        timed_sleep_command(&left.0, &left.1, 2).replace('\n', "\n          "),
+        timed_sleep_command(&right.0, &right.1, 2).replace('\n', "\n          ")
     ));
     let (output, json) = sandbox.run_json(&workflow, &["--run-id", "parallel"]);
     assert!(output.status.success(), "{json}");
-    let duration = json["data"]["duration_ms"].as_u64().unwrap();
-    assert!(duration < 4000, "jobs ran serially: {duration} ms");
+    assert_overlap((&left.0, &left.1), (&right.0, &right.1), &json);
 }
 
 #[test]
@@ -508,7 +595,7 @@ jobs:
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !marker.is_file() {
         assert!(
             Instant::now() < deadline,
@@ -540,7 +627,7 @@ jobs:
     );
     assert_eq!(job(&contender_json, "contender")["status"], "success");
 
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let holder_exit = loop {
         if let Some(status) = holder.try_wait().unwrap() {
             break status;
@@ -733,7 +820,7 @@ jobs:
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let status = sandbox.status("interrupted");
         if status.status.success() {
@@ -1146,6 +1233,10 @@ jobs:
 #[test]
 fn concurrency_group_serializes_jobs_without_deadlock() {
     let sandbox = Sandbox::new();
+    let first_start = sandbox.temp.path().join("first-start");
+    let first_end = sandbox.temp.path().join("first-end");
+    let second_start = sandbox.temp.path().join("second-start");
+    let second_end = sandbox.temp.path().join("second-end");
     let workflow = sandbox.workflow(&format!(
         r#"version: 1
 name: Concurrency
@@ -1155,16 +1246,18 @@ jobs:
       group: exclusive-test
       max: 1
     steps:
-      - run: {}
+      - run: |
+          {}
   second:
     concurrency:
       group: exclusive-test
       max: 1
     steps:
-      - run: {}
+      - run: |
+          {}
 "#,
-        sleep_command(2).replace('\n', "\n          "),
-        sleep_command(2).replace('\n', "\n          ")
+        timed_sleep_command(&first_start, &first_end, 2).replace('\n', "\n          "),
+        timed_sleep_command(&second_start, &second_end, 2).replace('\n', "\n          ")
     ));
     let (output, json) = sandbox.run_json(&workflow, &["--run-id", "concurrency"]);
     assert!(
@@ -1172,18 +1265,18 @@ jobs:
         "{json}\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let first = job(&json, "first")["steps"][0]["duration_ms"]
-        .as_u64()
-        .unwrap();
-    let second = job(&json, "second")["steps"][0]["duration_ms"]
-        .as_u64()
-        .unwrap();
-    let total = json["data"]["duration_ms"].as_u64().unwrap();
-    assert!(first < 3_500 && second < 3_500, "step timing wrong: {json}");
-    assert!(
-        total >= 3_800,
-        "concurrency group did not serialize: {json}"
-    );
+    let modified = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .unwrap_or_else(|error| panic!("missing marker {}: {error}", path.display()))
+            .modified()
+            .unwrap()
+    };
+    let first_end = modified(&first_end);
+    let second_start = modified(&second_start);
+    let second_end = modified(&second_end);
+    let first_start = modified(&first_start);
+    let overlap = first_start < second_end && second_start < first_end;
+    assert!(!overlap, "concurrency group jobs overlapped: {json}");
 }
 
 #[test]

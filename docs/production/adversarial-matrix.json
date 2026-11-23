@@ -1,0 +1,162 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "host": "Windows 10.0.26300 x64",
+    "rust": "1.99.1",
+    "executed_at": "2026-11-23T15:39:41Z"
+  },
+  "statuses": {
+    "PASS": "executed and asserted on this host",
+    "BLOCKED": "capability could not be executed on this host; never treated as passing",
+    "PARTIAL": "implemented and partly asserted, residual path not covered"
+  },
+  "cases": [
+    {
+      "id": "A01",
+      "input": "YAML alias expansion bomb (7x10 repeated aliases)",
+      "expected": "CONFIG_INVALID, no panic or unbounded memory",
+      "status": "PASS",
+      "evidence": ["pipeline::parser::tests::rejects_yaml_alias_expansion_bombs"]
+    },
+    {
+      "id": "A02",
+      "input": "Matrix expansion beyond DEFAULT_MAX_MATRIX_JOBS",
+      "expected": "CONFIG_INVALID naming the configured limit",
+      "status": "PASS",
+      "evidence": ["pipeline::matrix::tests::rejects_explosion_beyond_the_default_limit"]
+    },
+    {
+      "id": "A03",
+      "input": "Expression larger than 4096 bytes and templates with more than 128 segments",
+      "expected": "CONFIG_INVALID before evaluation",
+      "status": "PASS",
+      "evidence": ["pipeline::expression::tests::rejects_oversized_expressions_and_templates"]
+    },
+    {
+      "id": "A04",
+      "input": "../, absolute paths and Windows drive paths in artifact and step paths",
+      "expected": "path rejected or confined to the workspace",
+      "status": "PASS",
+      "evidence": [
+        "security::tests::rejects_traversal_and_absolute_paths",
+        "pipeline::validator::tests::rejects_step_path_escape",
+        "pipeline::artifacts::tests::lexical_containment_rejects_absolute_and_parent_paths"
+      ]
+    },
+    {
+      "id": "A05",
+      "input": "Directory junction inside the workspace pointing outside",
+      "expected": "escape rejected by canonicalized containment",
+      "status": "PASS",
+      "evidence": ["pipeline::artifacts::tests::junction_escape_is_rejected"],
+      "platform": "windows"
+    },
+    {
+      "id": "A06",
+      "input": "Symlink inside the workspace pointing outside",
+      "expected": "escape rejected by canonicalized containment",
+      "status": "BLOCKED",
+      "evidence": ["pipeline::artifacts::tests::symlink_escape_is_rejected"],
+      "platform": "unix",
+      "blocker": "the Unix-only test did not execute on the Windows host"
+    },
+    {
+      "id": "A07",
+      "input": "ZIP entry with ../ traversal during cache extraction",
+      "expected": "traversal entry rejected, nothing written outside the destination",
+      "status": "PASS",
+      "evidence": ["cache::tests::extraction_rejects_traversal_entries"]
+    },
+    {
+      "id": "A08",
+      "input": "Tampered artifact object after upload",
+      "expected": "ARTIFACT_INVALID on download",
+      "status": "PASS",
+      "evidence": ["pipeline::artifacts::tests::corrupted_artifact_object_is_rejected_on_download"]
+    },
+    {
+      "id": "A09",
+      "input": "Corrupt pipeline/cache entry",
+      "expected": "entry not restored and reported instead of silently used",
+      "status": "PASS",
+      "evidence": [
+        "cache::tests::tree_roundtrip_and_corruption_detection",
+        "pipeline::cache::tests::corrupt_entry_is_not_restored",
+        "cache::tests::concurrent_writers_produce_one_valid_entry"
+      ]
+    },
+    {
+      "id": "A10",
+      "input": "Workflow references a secret that does not exist",
+      "expected": "fail closed before any job runs",
+      "status": "PASS",
+      "evidence": ["pipeline_runtime::missing_secret_fails_closed_before_running_jobs"]
+    },
+    {
+      "id": "A11",
+      "input": "Secret value present in job output, environment report, error and manifest",
+      "expected": "value redacted on every serialized surface",
+      "status": "PASS",
+      "evidence": ["pipeline_runtime::secrets_are_injected_and_redacted_everywhere"]
+    },
+    {
+      "id": "A12",
+      "input": "Webhook request without the bearer token, and a non-loopback bind",
+      "expected": "401 before queueing; invalid bind is CONFIG_INVALID",
+      "status": "PASS",
+      "evidence": ["tests/daemon.rs::webhook_requires_configuration_and_authenticates_requests"]
+    },
+    {
+      "id": "A13",
+      "input": "Duplicate webhook delivery",
+      "expected": "409 and no second run",
+      "status": "PASS",
+      "evidence": ["tests/daemon.rs::webhook_requires_configuration_and_authenticates_requests"]
+    },
+    {
+      "id": "A14",
+      "input": "Webhook flood beyond the 60 requests/60 s limit",
+      "expected": "429 after the limit",
+      "status": "PASS",
+      "evidence": [
+        "cli::daemon::tests::rate_limit_and_constant_time_comparison",
+        "tests/daemon.rs::webhook_requires_configuration_and_authenticates_requests"
+      ]
+    },
+    {
+      "id": "A15",
+      "input": "Stale lease owner renews or releases after expiry",
+      "expected": "fenced out; new owner keeps the slot",
+      "status": "PASS",
+      "evidence": ["storage::tests::expired_lease_cannot_be_renewed_or_released_by_the_old_owner"]
+    },
+    {
+      "id": "A16",
+      "input": "Database written by a newer schema",
+      "expected": "SCHEMA_UNSUPPORTED before DDL; no migration",
+      "status": "PASS",
+      "evidence": ["storage::tests::newer_schema_is_rejected_before_ddl"]
+    },
+    {
+      "id": "A17",
+      "input": "security.mode=isolated with no available backend",
+      "expected": "SECURITY_CAPABILITY_UNAVAILABLE, exit 3, no native fallback and no run record",
+      "status": "PASS",
+      "evidence": ["pipeline_runtime::isolated_mode_fails_closed_without_a_backend"]
+    },
+    {
+      "id": "A18",
+      "input": "Filesystem or network escape from the isolated sandbox",
+      "expected": "sandbox policy prevents escape",
+      "status": "BLOCKED",
+      "evidence": [],
+      "blocker": "no verified isolation backend on Windows; bubblewrap only exists on Linux and was not executed"
+    }
+  ],
+  "summary": {
+    "total": 18,
+    "pass": 16,
+    "blocked": 2,
+    "partial": 0
+  }
+}

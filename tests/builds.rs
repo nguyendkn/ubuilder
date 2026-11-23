@@ -72,6 +72,77 @@ fn rust_fixture_builds_with_manifest_and_validated_artifact() {
     assert_eq!(records["data"][0]["target"], target);
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[test]
+fn dotnet_fixture_packages_a_runnable_executable() {
+    if Command::new("dotnet").arg("--version").output().is_err() {
+        eprintln!("dotnet is unavailable; skipping the .NET fixture");
+        return;
+    }
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture = repo.join("fixtures").join("dotnet-console");
+    let tmp = tempfile::tempdir().unwrap();
+    let output_dir = tmp.path().join("out");
+
+    let output = ubuilder()
+        .args([
+            "--path",
+            fixture.to_str().unwrap(),
+            "build",
+            "--target",
+            "windows-x64",
+            "--profile",
+            "debug",
+            "--format",
+            "zip",
+            "--no-cache",
+            "--output",
+            output_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .env("UBUILDER_DATA_DIR", tmp.path().join("data"))
+        .env("UBUILDER_CACHE_DIR", tmp.path().join("cache"))
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "dotnet build failed: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let report = &json["data"]["reports"][0];
+    assert_eq!(report["status"], "success");
+    let artifact = PathBuf::from(report["artifacts"][0]["path"].as_str().unwrap());
+    assert!(
+        report["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|validation| validation["status"] == "passed"),
+        "artifact validation failed: {}",
+        report["validations"]
+    );
+
+    let extract = tmp.path().join("extract");
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(&artifact).unwrap()).unwrap();
+    archive.extract(&extract).unwrap();
+    let exe = extract.join("HelloDotnet.exe");
+    assert!(exe.is_file(), "archive is missing HelloDotnet.exe");
+    let run = Command::new(&exe).output().unwrap();
+    assert!(
+        run.status.success(),
+        "packaged .NET executable failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("hello from HelloDotnet"),
+        "unexpected packaged output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
 fn native_target() -> &'static str {
     if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         "windows-x64"

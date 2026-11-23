@@ -384,6 +384,28 @@ mod tests {
     }
 
     #[test]
+    fn corrupted_artifact_object_is_rejected_on_download() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(&temp.path().join("ubuilder.db")).unwrap());
+        let store = ArtifactStore::open(&temp.path().join("artifacts"), db).unwrap();
+        let source = temp.path().join("payload.txt");
+        std::fs::write(&source, "original").unwrap();
+        let artifact = store.upload("run", "job", "payload", &source).unwrap();
+        let payload = temp
+            .path()
+            .join("artifacts/objects")
+            .join(&artifact.sha256)
+            .join("tree/payload.txt");
+        std::fs::write(&payload, "tampered").unwrap();
+
+        let error = store
+            .download("run", "payload", &temp.path().join("out"))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ArtifactInvalid);
+        assert!(error.message.contains("integrity verification"), "{error}");
+    }
+
+    #[test]
     fn lexical_containment_rejects_absolute_and_parent_paths() {
         assert!(validate_relative_path("dist/a").is_ok());
         assert!(validate_relative_path("./dist/a").is_ok());

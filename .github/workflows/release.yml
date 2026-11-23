@@ -16,13 +16,16 @@ jobs:
         include:
           - os: windows-latest
             platform: windows
-            asset: ubuilder-windows-x64.zip
+            arch: x64
           - os: ubuntu-latest
             platform: linux
-            asset: ubuilder-linux-x64.tar.gz
+            arch: x64
+          - os: macos-13
+            platform: macos
+            arch: x64
           - os: macos-latest
             platform: macos
-            asset: ubuilder-macos.tar.gz
+            arch: arm64
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
@@ -35,25 +38,48 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --all-targets --locked
       - name: Build
         run: cargo build --release --locked
       - name: Package
-        run: python scripts/package.py --platform ${{ matrix.platform }} --output dist
-      - name: Checksums
-        run: python scripts/checksums.py dist
-      - name: Sign (optional hook)
+        run: python scripts/package.py --platform ${{ matrix.platform }} --arch ${{ matrix.arch }} --output dist
+      - name: Sign (optional hook; signs the archive bytes)
         if: ${{ env.UBUILDER_SIGN_COMMAND != '' }}
         shell: bash
         run: eval "$UBUILDER_SIGN_COMMAND"
+      - name: Smoke test the packaged binary
+        shell: bash
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tarfile, tempfile, zipfile
+          from pathlib import Path
+          name = {
+              ("windows", "x64"): "ubuilder-windows-x64.zip",
+              ("linux", "x64"): "ubuilder-linux-x64.tar.gz",
+              ("macos", "x64"): "ubuilder-macos-x64.tar.gz",
+              ("macos", "arm64"): "ubuilder-macos-arm64.tar.gz",
+          }[("${{ matrix.platform }}", "${{ matrix.arch }}")]
+          archive = Path("dist") / name
+          dest = Path(tempfile.mkdtemp())
+          if archive.suffix == ".zip":
+              zipfile.ZipFile(archive).extractall(dest)
+              binary = dest / "ubuilder.exe"
+          else:
+              with tarfile.open(archive) as tar:
+                  tar.extractall(dest, filter="data")
+              binary = dest / "ubuilder"
+          binary.chmod(0o755)
+          out = subprocess.run([str(binary), "--version"], capture_output=True, text=True)
+          print(out.stdout, out.stderr)
+          sys.exit(out.returncode)
+          PY
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: |
-            dist/${{ matrix.asset }}
-            dist/SHA256SUMS
+          name: ${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/*
+
   sbom:
     runs-on: ubuntu-latest
     steps:
@@ -62,25 +88,30 @@ jobs:
         run: |
           mkdir -p dist
           python scripts/sbom.py > dist/sbom.cdx.json
-          python scripts/checksums.py dist
       - uses: actions/upload-artifact@v4
         with:
           name: sbom
-          path: |
-            dist/sbom.cdx.json
-            dist/SHA256SUMS
+          path: dist/sbom.cdx.json
+
   publish:
     needs: [build, sbom]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - uses: actions/download-artifact@v4
         with:
           path: dist
-      - name: Flatten and combine checksums
+      - name: Flatten artifacts
         run: |
           mkdir -p release
           find dist -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name 'sbom.cdx.json' \) -exec cp {} release/ \;
-          find dist -name SHA256SUMS -exec cat {} \; | sort -u > release/SHA256SUMS
+      - name: Release manifest and checksums
+        run: |
+          python scripts/manifest.py --version "${GITHUB_REF_NAME#v}" --dir release
+          python scripts/checksums.py release
       - uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -88,4 +119,5 @@ jobs:
             release/*.tar.gz
             release/SHA256SUMS
             release/sbom.cdx.json
+            release/release-manifest.json
           fail_on_unmatched_files: true

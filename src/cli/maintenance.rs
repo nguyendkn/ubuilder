@@ -44,6 +44,9 @@ pub struct DoctorArgs {
     /// Framework to evaluate when no project is detected.
     #[arg(long)]
     pub framework: Option<String>,
+    /// Diagnose every canonical target instead of only the native target.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -195,7 +198,7 @@ pub fn doctor(cli: &Cli, args: &DoctorArgs, ui: &Ui) -> Result<i32> {
             .unwrap_or(FrameworkKind::Rust),
     };
     let targets = if args.target.is_empty() {
-        builder::resolve_targets(&[], false, &host)?
+        builder::resolve_targets(&[], args.all, &host)?
     } else {
         args.target
             .iter()

@@ -1,5 +1,7 @@
 /target/
 fixtures/*/target/
+fixtures/*/bin/
+fixtures/*/obj/
 node_modules/
 **/.ubuilder/*
 !/.ubuilder/workflows/
