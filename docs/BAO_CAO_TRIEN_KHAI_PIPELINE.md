@@ -15,7 +15,7 @@ Báo cáo này là bản cuối sau finalization. Nguồn chuẩn cho từng tuy
 
 Commit mã nguồn cuối: `a4cd66d0e206670872a81622d8742231c316dd42`.  
 Artifact phát hành được đóng từ commit tài liệu `bb2708c90440e014df74a32b8dd3bb5681b8e4b4`.  
-HEAD tài liệu tại thời điểm viết: `8c640831a6230014a00558905f43bdfe4546d814`.
+HEAD trước lần cập nhật báo cáo này: `8c640831a6230014a00558905f43bdfe4546d814`.
 
 ---
 
@@ -524,9 +524,9 @@ Rủi ro vận hành chính: pipeline chạy lệnh tùy ý với quyền ngư�
 | `bb2708c` | `docs: publish scoped readiness gates and final measurements` — nguồn của artifact phát hành |
 | `e703892` | `docs: record final release hashes and smoke verification` |
 | `52ddd31` | `ci: pin Python for release packaging and smoke tests` |
-| `8c64083` | `docs: align architecture, risk and migration with final behavior` — HEAD tài liệu |
+| `8c64083` | `docs: align architecture, risk and migration with final behavior` — HEAD trước bản cập nhật báo cáo |
 
-Repository sạch tại `8c64083`; `dist/` và `target/` được ignore. Artifact được đóng từ `bb2708c`, sau đó tài liệu được cập nhật thêm; manifest và `RELEASE_VERIFICATION.md` ghi đúng commit nguồn của artifact.
+Repository sạch trước và sau commit báo cáo; `dist/` và `target/` được ignore. Artifact được đóng từ `bb2708c`, sau đó tài liệu được cập nhật thêm; manifest và `RELEASE_VERIFICATION.md` ghi đúng commit nguồn của artifact.
 
 ---
 
