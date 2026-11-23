@@ -314,7 +314,7 @@ fn validate_step(
                 );
                 if !directory.contains("${{") {
                     if let Err(error) =
-                        crate::pipeline::artifacts::safe_join(Path::new("workspace"), directory)
+                        crate::pipeline::artifacts::validate_relative_path(directory)
                     {
                         diagnostics.push(
                             diag(path, source, "PATH_ESCAPE", "working-directory")

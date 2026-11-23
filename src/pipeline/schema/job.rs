@@ -19,6 +19,8 @@ pub struct WorkflowDefinition {
     pub env: IndexMap<String, String>,
     #[serde(default)]
     pub defaults: WorkflowDefaults,
+    #[serde(default)]
+    pub security: crate::pipeline::isolation::IsolationPolicy,
     #[serde(deserialize_with = "deserialize_jobs")]
     pub jobs: IndexMap<JobId, JobDefinition>,
 }

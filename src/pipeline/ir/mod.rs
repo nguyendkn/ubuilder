@@ -1,6 +1,7 @@
 //! Serializable intermediate representation consumed by the planner/runtime.
 
 use crate::pipeline::expression::{Expression, Template};
+use crate::pipeline::isolation::IsolationPolicy;
 use crate::pipeline::schema::{
     Backoff, ConcurrencyPolicy, ExecutionBackend, RetryPolicy, RunnerSpec,
 };
@@ -15,6 +16,8 @@ pub struct WorkflowIr {
     pub source_path: PathBuf,
     pub source_digest: String,
     pub env: IndexMap<String, Template>,
+    #[serde(default)]
+    pub security: IsolationPolicy,
     pub jobs: Vec<IrJob>,
     /// Jobs in deterministic dependency order.
     pub order: Vec<String>,

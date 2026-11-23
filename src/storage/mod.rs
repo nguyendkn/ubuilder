@@ -5,15 +5,30 @@
 
 use crate::error::{ErrorCode, Result, UbuilderError};
 use crate::pipeline::state::{validate_transition, RunState, StateEntity};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
+
+/// Bump when a migration is added. A database written by a newer `ubuilder`
+/// is rejected before any DDL so an older binary cannot silently corrupt state.
+pub const SCHEMA_VERSION: u32 = 2;
 
 pub struct Db {
     conn: Mutex<Connection>,
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConcurrencyLease {
+    pub group: String,
+    pub owner: String,
+    pub slot: i64,
+    pub token: String,
+    pub generation: i64,
+    pub lease_until: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,9 +182,42 @@ impl Db {
         &self.path
     }
 
-    fn migrate(&self) -> Result<()> {
+    pub fn schema_version(&self) -> Result<u32> {
         let conn = self.lock();
-        conn.execute_batch(
+        read_schema_version(&conn)
+    }
+
+    fn migrate(&self) -> Result<()> {
+        let mut conn = self.lock();
+        let existing = read_schema_version(&conn)?;
+        if existing > SCHEMA_VERSION {
+            return Err(UbuilderError::new(
+                ErrorCode::SchemaUnsupported,
+                format!(
+                    "database schema version {existing} is newer than this ubuilder supports ({SCHEMA_VERSION})"
+                ),
+            )
+            .remediation("Upgrade ubuilder before using this data directory")
+            .details(serde_json::json!({
+                "database": self.path,
+                "found_version": existing,
+                "supported_version": SCHEMA_VERSION,
+            })));
+        }
+        let has_tables: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_migrations')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| db_error("inspect schema", e))?;
+        if has_tables && existing < SCHEMA_VERSION && self.path != Path::new(":memory:") {
+            backup_before_migration(&conn, &self.path, existing)?;
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| db_error("begin schema migration", e))?;
+        tx.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
@@ -287,10 +335,16 @@ impl Db {
                 slot INTEGER NOT NULL,
                 owner TEXT NOT NULL,
                 lease_until INTEGER NOT NULL,
+                token TEXT NOT NULL DEFAULT '',
+                generation INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (group_name, slot)
             );
             CREATE INDEX IF NOT EXISTS idx_concurrency_owner
                 ON pipeline_concurrency_slots (group_name, owner);
+            CREATE TABLE IF NOT EXISTS pipeline_concurrency_generations (
+                group_name TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS artifact_pins (
                 sha256 TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -303,10 +357,25 @@ impl Db {
             "#,
         )
         .map_err(|e| db_error("migrate schema", e))?;
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?1)",
-            params![crate::telemetry::now_ms() as i64],
-        );
+        add_column_if_missing(
+            &tx,
+            "pipeline_concurrency_slots",
+            "token",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        add_column_if_missing(
+            &tx,
+            "pipeline_concurrency_slots",
+            "generation",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            params![SCHEMA_VERSION as i64, crate::telemetry::now_ms() as i64],
+        )
+        .map_err(|e| db_error("record schema version", e))?;
+        tx.commit()
+            .map_err(|e| db_error("commit schema migration", e))?;
         Ok(())
     }
 
@@ -779,7 +848,7 @@ impl Db {
             .map_err(|e| db_error("read stale runs", e))?;
         for id in &ids {
             conn.execute(
-                "UPDATE pipeline_runs SET status='failed', error='run interrupted (stale running state)', finished_at=?1 WHERE id=?2",
+                "UPDATE pipeline_runs SET status='failed', error='run interrupted (stale running state; side effects of in-flight steps are unknown)', finished_at=?1 WHERE id=?2",
                 params![crate::telemetry::now_ms() as i64, id],
             )
             .map_err(|e| db_error("recover stale run", e))?;
@@ -788,6 +857,13 @@ impl Db {
                 params![id],
             )
             .map_err(|e| db_error("recover stale jobs", e))?;
+            // The process that owned a slot is gone; do not make the next run
+            // wait for the full lease TTL after an explicit recovery.
+            conn.execute(
+                "DELETE FROM pipeline_concurrency_slots WHERE owner LIKE ?1",
+                params![format!("{id}/%")],
+            )
+            .map_err(|e| db_error("release stale concurrency leases", e))?;
         }
         Ok(ids)
     }
@@ -1012,41 +1088,57 @@ impl Db {
         Ok(changed > 0)
     }
 
-    /// Acquire one of `max` slots in a group. Returns the slot number.
-    pub fn acquire_concurrency_slot(
+    /// Acquire one of `max` slots in a group and return a fenced lease.
+    /// Expired leases are reclaimable. A stale owner cannot release or renew a
+    /// lease after another process has acquired the same slot, because every
+    /// renewal and release includes the lease token and generation.
+    pub fn acquire_concurrency_lease(
         &self,
         group: &str,
         owner: &str,
         max: usize,
         now: u128,
         lease_ms: u128,
-    ) -> Result<Option<i64>> {
+    ) -> Result<Option<ConcurrencyLease>> {
         let mut conn = self.lock();
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| db_error("begin concurrency slot", e))?;
         tx.execute(
             "DELETE FROM pipeline_concurrency_slots WHERE group_name=?1 AND lease_until < ?2",
             params![group, now as i64],
         )
         .map_err(|e| db_error("expire concurrency slots", e))?;
-        let own: Option<i64> = tx
+        let own: Option<(i64, String, i64)> = tx
             .query_row(
-                "SELECT slot FROM pipeline_concurrency_slots WHERE group_name=?1 AND owner=?2 LIMIT 1",
+                "SELECT slot, token, generation FROM pipeline_concurrency_slots WHERE group_name=?1 AND owner=?2 LIMIT 1",
                 params![group, owner],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|e| db_error("read own concurrency slot", e))?;
-        if let Some(slot) = own {
+        if let Some((slot, token, generation)) = own {
+            let token = if token.is_empty() {
+                new_lease_token(group, owner, now)
+            } else {
+                token
+            };
+            let lease_until = now.saturating_add(lease_ms);
             tx.execute(
-                "UPDATE pipeline_concurrency_slots SET lease_until=?1 WHERE group_name=?2 AND slot=?3",
-                params![(now + lease_ms) as i64, group, slot],
+                "UPDATE pipeline_concurrency_slots SET lease_until=?1, token=?2, generation=?3 WHERE group_name=?4 AND slot=?5",
+                params![lease_until as i64, token, generation, group, slot],
             )
             .map_err(|e| db_error("renew concurrency slot", e))?;
             tx.commit()
                 .map_err(|e| db_error("commit concurrency slot", e))?;
-            return Ok(Some(slot));
+            return Ok(Some(ConcurrencyLease {
+                group: group.to_string(),
+                owner: owner.to_string(),
+                slot,
+                token,
+                generation,
+                lease_until,
+            }));
         }
         let used: i64 = tx
             .query_row(
@@ -1056,6 +1148,8 @@ impl Db {
             )
             .map_err(|e| db_error("count concurrency slots", e))?;
         if used as usize >= max.max(1) {
+            tx.commit()
+                .map_err(|e| db_error("commit expired concurrency slots", e))?;
             return Ok(None);
         }
         let mut slot = 0i64;
@@ -1071,39 +1165,115 @@ impl Db {
         {
             slot += 1;
         }
+        let generation: i64 = tx
+            .query_row(
+                "INSERT INTO pipeline_concurrency_generations (group_name, generation) VALUES (?1, 1) ON CONFLICT(group_name) DO UPDATE SET generation=generation+1 RETURNING generation",
+                params![group],
+                |row| row.get(0),
+            )
+            .map_err(|e| db_error("next concurrency generation", e))?;
+        let token = new_lease_token(group, owner, now);
+        let lease_until = now.saturating_add(lease_ms);
         tx.execute(
-            "INSERT INTO pipeline_concurrency_slots (group_name, slot, owner, lease_until) VALUES (?1, ?2, ?3, ?4)",
-            params![group, slot, owner, (now + lease_ms) as i64],
+            "INSERT INTO pipeline_concurrency_slots (group_name, slot, owner, lease_until, token, generation) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![group, slot, owner, lease_until as i64, token, generation],
         )
         .map_err(|e| db_error("insert concurrency slot", e))?;
         tx.commit()
             .map_err(|e| db_error("commit concurrency slot", e))?;
-        Ok(Some(slot))
+        Ok(Some(ConcurrencyLease {
+            group: group.to_string(),
+            owner: owner.to_string(),
+            slot,
+            token,
+            generation,
+            lease_until,
+        }))
     }
 
-    pub fn release_concurrency_slot(&self, group: &str, owner: &str) -> Result<()> {
+    /// Refresh a lease. Returns false when the lease was lost.
+    pub fn renew_concurrency_lease(
+        &self,
+        lease: &ConcurrencyLease,
+        now: u128,
+        lease_ms: u128,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn
+            .execute(
+                "UPDATE pipeline_concurrency_slots SET lease_until=?1 WHERE group_name=?2 AND slot=?3 AND owner=?4 AND token=?5 AND generation=?6",
+                params![
+                    now.saturating_add(lease_ms) as i64,
+                    lease.group,
+                    lease.slot,
+                    lease.owner,
+                    lease.token,
+                    lease.generation
+                ],
+            )
+            .map_err(|e| db_error("renew concurrency lease", e))?;
+        Ok(changed == 1)
+    }
+
+    /// Release only the lease matching this token and generation.
+    pub fn release_concurrency_lease(&self, lease: &ConcurrencyLease) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn
+            .execute(
+                "DELETE FROM pipeline_concurrency_slots WHERE group_name=?1 AND slot=?2 AND owner=?3 AND token=?4 AND generation=?5",
+                params![
+                    lease.group,
+                    lease.slot,
+                    lease.owner,
+                    lease.token,
+                    lease.generation
+                ],
+            )
+            .map_err(|e| db_error("release concurrency slot", e))?;
+        Ok(changed == 1)
+    }
+
+    /// Drop every expired slot. Used by crash recovery.
+    pub fn expire_concurrency_leases(&self, now: u128) -> Result<usize> {
         let conn = self.lock();
         conn.execute(
-            "DELETE FROM pipeline_concurrency_slots WHERE group_name=?1 AND owner=?2",
-            params![group, owner],
+            "DELETE FROM pipeline_concurrency_slots WHERE lease_until < ?1",
+            params![now as i64],
         )
-        .map_err(|e| db_error("release concurrency slot", e))?;
-        Ok(())
+        .map_err(|e| db_error("expire concurrency slots", e))
+    }
+
+    /// Leases currently holding slots in a group.
+    pub fn concurrency_leases(&self, group: &str) -> Result<Vec<ConcurrencyLease>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT group_name, slot, owner, token, generation, lease_until FROM pipeline_concurrency_slots WHERE group_name=?1 ORDER BY slot",
+            )
+            .map_err(|e| db_error("prepare concurrency leases", e))?;
+        let rows = stmt
+            .query_map(params![group], |row| {
+                Ok(ConcurrencyLease {
+                    group: row.get(0)?,
+                    slot: row.get(1)?,
+                    owner: row.get(2)?,
+                    token: row.get(3)?,
+                    generation: row.get(4)?,
+                    lease_until: row.get::<_, i64>(5)? as u128,
+                })
+            })
+            .map_err(|e| db_error("query concurrency leases", e))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| db_error("read concurrency leases", e))
     }
 
     /// Owners currently holding slots in a group.
     pub fn concurrency_owners(&self, group: &str) -> Result<Vec<String>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT owner FROM pipeline_concurrency_slots WHERE group_name=?1 ORDER BY slot",
-            )
-            .map_err(|e| db_error("prepare concurrency owners", e))?;
-        let rows = stmt
-            .query_map(params![group], |row| row.get(0))
-            .map_err(|e| db_error("query concurrency owners", e))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| db_error("read concurrency owners", e))
+        Ok(self
+            .concurrency_leases(group)?
+            .into_iter()
+            .map(|lease| lease.owner)
+            .collect())
     }
 
     pub fn release_pipeline_lock(&self, group: &str, owner: &str) -> Result<()> {
@@ -1115,6 +1285,78 @@ impl Db {
         .map_err(|e| db_error("release pipeline lock", e))?;
         Ok(())
     }
+}
+
+fn read_schema_version(conn: &Connection) -> Result<u32> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| db_error("inspect schema version", e))?;
+    if !exists {
+        return Ok(0);
+    }
+    let max: Option<i64> = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| db_error("read schema version", e))?;
+    Ok(max.unwrap_or(0).max(0) as u32)
+}
+
+fn backup_before_migration(conn: &Connection, path: &Path, from: u32) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("ubuilder.db");
+    let backup = path.with_file_name(format!(
+        "{file_name}.v{from}-{}.bak",
+        crate::telemetry::now_ms()
+    ));
+    let backup_text = backup.to_string_lossy().to_string();
+    conn.execute("VACUUM INTO ?1", params![backup_text])
+        .map_err(|e| db_error("back up database before migration", e))?;
+    Ok(backup)
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| db_error("inspect table columns", e))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| db_error("read table columns", e))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| db_error("read table columns", e))?
+        .iter()
+        .any(|name| name == column);
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}"),
+            [],
+        )
+        .map_err(|e| db_error(format!("add {table}.{column}"), e))?;
+    }
+    Ok(())
+}
+
+fn new_lease_token(group: &str, owner: &str, now: u128) -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    crate::artifacts::sha256_bytes(
+        format!(
+            "{group}\0{owner}\0{now}\0{}\0{sequence}",
+            std::process::id()
+        )
+        .as_bytes(),
+    )
 }
 
 fn pipeline_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PipelineRunRecord> {
@@ -1228,6 +1470,97 @@ mod tests {
         })
         .unwrap();
         assert_eq!(db.list_artifacts(Some("windows-x64")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn newer_schema_is_rejected_before_ddl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("newer.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+                 INSERT INTO schema_migrations(version, applied_at) VALUES (99, 1);",
+            )
+            .unwrap();
+        }
+        let error = match Db::open(&path) {
+            Ok(_) => panic!("newer schema must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::SchemaUnsupported, "{error}");
+        let conn = Connection::open(&path).unwrap();
+        let jobs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='jobs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(jobs, 0, "rejection must happen before any DDL");
+    }
+
+    #[test]
+    fn version_one_database_is_backed_up_and_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ubuilder.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+                 INSERT INTO schema_migrations(version, applied_at) VALUES (1, 1);
+                 CREATE TABLE pipeline_concurrency_slots (
+                     group_name TEXT NOT NULL,
+                     slot INTEGER NOT NULL,
+                     owner TEXT NOT NULL,
+                     lease_until INTEGER NOT NULL,
+                     PRIMARY KEY (group_name, slot)
+                 );",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
+            .count();
+        assert_eq!(backups, 1, "upgrade must leave a consistent backup");
+        let conn = Connection::open(&path).unwrap();
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(pipeline_concurrency_slots)")
+            .unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "token"));
+        assert!(columns.iter().any(|column| column == "generation"));
+    }
+
+    #[test]
+    fn expired_lease_cannot_be_renewed_or_released_by_the_old_owner() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db
+            .acquire_concurrency_lease("build", "run-a/job", 1, 100, 10)
+            .unwrap()
+            .expect("first lease");
+        assert!(db
+            .acquire_concurrency_lease("build", "run-b/job", 1, 105, 10)
+            .unwrap()
+            .is_none());
+        let second = db
+            .acquire_concurrency_lease("build", "run-a/job", 1, 111, 10)
+            .unwrap()
+            .expect("expired slot is reclaimable");
+        assert_ne!(first.token, second.token);
+        assert!(second.generation > first.generation);
+        assert!(!db.renew_concurrency_lease(&first, 120, 10).unwrap());
+        assert!(!db.release_concurrency_lease(&first).unwrap());
+        assert!(db.release_concurrency_lease(&second).unwrap());
+        assert!(db.concurrency_leases("build").unwrap().is_empty());
     }
 
     #[test]

@@ -439,7 +439,12 @@ fn restrict_file(path: &Path) -> Result<()> {
         .map_err(|error| UbuilderError::io("cannot secure secret file permissions", error))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn restrict_file(path: &Path) -> Result<()> {
+    apply_windows_acl(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn restrict_file(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -451,8 +456,74 @@ fn restrict_dir(path: &Path) -> Result<()> {
         .map_err(|error| UbuilderError::io("cannot secure secret directory permissions", error))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn restrict_dir(path: &Path) -> Result<()> {
+    reject_reparse_point(path)?;
+    apply_windows_acl(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn restrict_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Replace inherited ACLs with a single explicit grant to the current user.
+/// Inherited `Users`/`Authenticated Users` grants would otherwise expose the
+/// secret file to every local account.
+#[cfg(windows)]
+fn apply_windows_acl(path: &Path) -> Result<()> {
+    let user = windows_current_user()?;
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:F"))
+        .output()
+        .map_err(|error| UbuilderError::io("cannot run icacls for secret file", error))?;
+    if !output.status.success() {
+        return Err(UbuilderError::new(
+            ErrorCode::Io,
+            format!(
+                "cannot restrict secret ACL: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        )
+        .remediation("Ensure `icacls` is available and the current user owns the data directory"));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_current_user() -> Result<String> {
+    let output = std::process::Command::new("whoami")
+        .output()
+        .map_err(|error| UbuilderError::io("cannot determine current Windows user", error))?;
+    let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || user.is_empty() {
+        return Err(UbuilderError::new(
+            ErrorCode::Internal,
+            "cannot determine current Windows user for secret ACL",
+        ));
+    }
+    Ok(user)
+}
+
+#[cfg(windows)]
+fn reject_reparse_point(path: &Path) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(UbuilderError::new(
+                ErrorCode::ConfigInvalid,
+                format!(
+                    "secret directory {} is a reparse point; refusing to trust its ACL",
+                    path.display()
+                ),
+            )
+            .remediation("Point UBUILDER_DATA_DIR at a normal directory"));
+        }
+    }
     Ok(())
 }
 
@@ -497,5 +568,30 @@ mod tests {
         assert!(validate_name("1TOKEN").is_err());
         assert!(validate_name("../TOKEN").is_err());
         assert!(validate_name("").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_secret_file_has_no_inherited_aces() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = FileSecretProvider::new(temp.path().join(SECRET_FILE));
+        let mut entries = BTreeMap::new();
+        entries.insert("TOKEN".into(), "abc123".into());
+        provider.write(&entries).unwrap();
+        let output = std::process::Command::new("icacls")
+            .arg(provider.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let acl = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !acl.contains("(I)"),
+            "inherited ACE survived explicit ACL: {acl}"
+        );
+        assert!(
+            acl.to_ascii_lowercase()
+                .contains(&windows_current_user().unwrap().to_ascii_lowercase()),
+            "current user missing from ACL: {acl}"
+        );
     }
 }

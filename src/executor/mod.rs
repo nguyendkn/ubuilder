@@ -98,6 +98,7 @@ pub struct ExecutorConfig {
     pub allowlist: Vec<String>,
     pub log_dir: Option<PathBuf>,
     pub verbose: bool,
+    pub isolation: Option<crate::pipeline::isolation::IsolationSession>,
 }
 
 impl Default for ExecutorConfig {
@@ -106,6 +107,7 @@ impl Default for ExecutorConfig {
             allowlist: crate::config::default_env_allowlist(),
             log_dir: None,
             verbose: false,
+            isolation: None,
         }
     }
 }
@@ -158,8 +160,12 @@ impl Executor {
         let started = Instant::now();
         let log_path = self.step_log_path(step_id);
         let mut log_file = self.open_log(step_id)?;
-        let mut cmd = Command::new(&spec.program);
-        cmd.args(&spec.args);
+        let (program, args) = match &self.config.isolation {
+            Some(session) => session.wrap(&spec.program, &spec.args),
+            None => (spec.program.clone(), spec.args.clone()),
+        };
+        let mut cmd = Command::new(&program);
+        cmd.args(&args);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());

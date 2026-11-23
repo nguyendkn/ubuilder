@@ -280,9 +280,9 @@ pub fn safe_filename(name: &str) -> String {
         .collect()
 }
 
-/// Reject absolute paths and `..` components; then verify parent canonical paths
-/// remain under the workspace when the path exists.
-pub fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
+/// Lexical containment check that does not touch the filesystem. Used by the
+/// validator, which runs before a workspace exists.
+pub fn validate_relative_path(relative: &str) -> Result<()> {
     let candidate = Path::new(relative);
     if candidate.is_absolute() {
         return Err(UbuilderError::new(
@@ -299,6 +299,50 @@ pub fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
                 ErrorCode::ConfigInvalid,
                 format!("path '{relative}' escapes the job workspace"),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject absolute paths and `..` components; then verify every existing path
+/// prefix, resolving symlinks and Windows junctions, remains under the
+/// workspace. A missing suffix is safe because no component can redirect it
+/// yet; callers that create directories must still create them one level at a
+/// time rather than following an attacker-controlled parent.
+pub fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
+    validate_relative_path(relative)?;
+    let candidate = Path::new(relative);
+    let canonical_root = root.canonicalize().map_err(|error| {
+        UbuilderError::io(
+            format!("cannot resolve workspace {}", root.display()),
+            error,
+        )
+    })?;
+    let mut prefix = root.to_path_buf();
+    for component in candidate.components() {
+        prefix.push(component.as_os_str());
+        match prefix.canonicalize() {
+            Ok(resolved) => {
+                if !resolved.starts_with(&canonical_root) {
+                    return Err(UbuilderError::new(
+                        ErrorCode::ConfigInvalid,
+                        format!("path '{relative}' escapes the job workspace"),
+                    )
+                    .details(serde_json::json!({ "resolved": resolved })));
+                }
+            }
+            Err(_) => {
+                // A broken symlink or junction exists but cannot be resolved;
+                // treating it as a plain missing directory would let a later
+                // write land outside the workspace.
+                if std::fs::symlink_metadata(&prefix).is_ok() {
+                    return Err(UbuilderError::new(
+                        ErrorCode::ConfigInvalid,
+                        format!("path '{relative}' contains an unresolvable link"),
+                    ));
+                }
+                break;
+            }
         }
     }
     Ok(root.join(candidate))
@@ -332,9 +376,54 @@ mod tests {
 
     #[test]
     fn joins_are_confined() {
-        let root = Path::new("workspace");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
         assert_eq!(safe_join(root, "dist/a").unwrap(), root.join("dist/a"));
         assert!(safe_join(root, "../elsewhere").is_err());
         assert!(safe_join(root, "C:\\temp").is_err());
+    }
+
+    #[test]
+    fn lexical_containment_rejects_absolute_and_parent_paths() {
+        assert!(validate_relative_path("dist/a").is_ok());
+        assert!(validate_relative_path("./dist/a").is_ok());
+        for escaped in ["../outside", "a/../../outside", "/etc/passwd"] {
+            let error = validate_relative_path(escaped).unwrap_err();
+            assert_eq!(error.code, ErrorCode::ConfigInvalid, "{escaped}: {error}");
+        }
+        #[cfg(windows)]
+        assert!(validate_relative_path("C:\\Windows").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        assert!(safe_join(&root, "link/file").is_err());
+        assert!(safe_join(&root, "missing/file").is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_escape_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root.join("link"))
+            .arg(&outside)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(safe_join(&root, "link/file").is_err());
+        assert!(safe_join(&root, "missing/file").is_ok());
     }
 }

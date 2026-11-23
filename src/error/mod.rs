@@ -20,6 +20,8 @@ pub enum ErrorCode {
     CacheCorrupt,
     ArtifactInvalid,
     SigningUnsupported,
+    SchemaUnsupported,
+    SecurityCapabilityUnavailable,
     ApprovalRequired,
     NotVerified,
     StateInvalid,
@@ -43,6 +45,8 @@ impl ErrorCode {
             ErrorCode::CacheCorrupt => "CACHE_CORRUPT",
             ErrorCode::ArtifactInvalid => "ARTIFACT_INVALID",
             ErrorCode::SigningUnsupported => "SIGNING_UNSUPPORTED",
+            ErrorCode::SchemaUnsupported => "SCHEMA_UNSUPPORTED",
+            ErrorCode::SecurityCapabilityUnavailable => "SECURITY_CAPABILITY_UNAVAILABLE",
             ErrorCode::ApprovalRequired => "APPROVAL_REQUIRED",
             ErrorCode::NotVerified => "NOT_VERIFIED",
             ErrorCode::StateInvalid => "STATE_INVALID",
@@ -60,6 +64,8 @@ impl ErrorCode {
             | ErrorCode::ConfigInvalid
             | ErrorCode::UnsupportedTarget
             | ErrorCode::ToolchainMissing
+            | ErrorCode::SchemaUnsupported
+            | ErrorCode::SecurityCapabilityUnavailable
             | ErrorCode::ApprovalRequired => 3,
             ErrorCode::Cancelled => 130,
             _ => 1,

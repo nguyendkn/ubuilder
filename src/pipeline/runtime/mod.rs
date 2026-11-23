@@ -16,10 +16,13 @@ use crate::pipeline::events::{EventKind, Events};
 use crate::pipeline::expression::context::Context;
 use crate::pipeline::expression::Template;
 use crate::pipeline::ir::{IrJob, IrStep, IrStepKind, WorkflowIr};
+use crate::pipeline::isolation::{self, IsolationProvider};
 use crate::pipeline::planner;
 use crate::pipeline::state::RunState;
 use crate::secrets::SecretManager;
-use crate::storage::{Db, PipelineJobRecord, PipelineRunRecord, PipelineStepRecord};
+use crate::storage::{
+    ConcurrencyLease, Db, PipelineJobRecord, PipelineRunRecord, PipelineStepRecord,
+};
 use crate::telemetry::{now_ms, Ui};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -31,6 +34,11 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+
+/// Concurrency leases are short-lived and renewed while a job runs. A crashed
+/// process is reclaimable after this window without waiting for an hour.
+const CONCURRENCY_LEASE_MS: u128 = 60_000;
+const CONCURRENCY_HEARTBEAT: Duration = Duration::from_secs(15);
 
 /// Options for one pipeline invocation.
 #[derive(Debug, Clone, Default)]
@@ -123,7 +131,9 @@ struct Shared {
     inputs: IndexMap<String, String>,
     workflow_env: IndexMap<String, String>,
     secret_values: BTreeMap<String, String>,
+    secrets_by_job: HashMap<String, BTreeMap<String, String>>,
     secret_redactions: Vec<String>,
+    isolation: Option<Arc<dyn IsolationProvider>>,
     jobs_root: PathBuf,
     logs_root: PathBuf,
     no_cache: bool,
@@ -146,6 +156,12 @@ impl Shared {
             .expect("pipeline result lock")
             .insert(job_id.to_string(), summary);
     }
+
+    fn job_secrets(&self, job_id: &str) -> &BTreeMap<String, String> {
+        self.secrets_by_job
+            .get(job_id)
+            .unwrap_or(&self.secret_values)
+    }
 }
 
 /// Executes a compiled workflow.
@@ -163,6 +179,11 @@ pub async fn run(
 ) -> Result<RunReport> {
     let plan = planner::plan(ir, source_root, host)?;
     let selected = select_jobs(ir, options.job.as_deref())?;
+    let isolation_provider = if ir.security.mode == isolation::TrustMode::Isolated {
+        Some(Arc::from(isolation::select(&ir.security)?))
+    } else {
+        None
+    };
     let run_id = match options.run_id.as_deref() {
         Some(id) => {
             validate_run_id(id)?;
@@ -210,13 +231,25 @@ pub async fn run(
         .map(|(name, value)| (name, value.into_inner()))
         .collect();
     let secret_redactions: Vec<String> = secret_values.values().cloned().collect();
+    let mut secrets_by_job = HashMap::new();
+    for job in &ir.jobs {
+        let representation = serde_json::to_string(job)
+            .map_err(|error| UbuilderError::new(ErrorCode::Internal, error.to_string()))?;
+        let scoped = scoped_secrets(&representation, &secret_values);
+        secrets_by_job.insert(job.id.clone(), scoped);
+    }
     let artifacts = ArtifactStore::open(&pipeline_root.join("artifacts"), db.clone())?;
     let cache_enabled = !options.no_cache;
+    let toolchain = crate::cache::toolchain_fingerprint(&crate::providers::facts::collect(
+        host,
+        Some(source_root),
+    ));
     let cache = PipelineCache::open(
         &pipeline_root.join("cache"),
         cache_enabled,
         &host.display(),
         ir,
+        &toolchain,
     )?;
 
     // Workflow-level environment is evaluated once, without matrix/job data.
@@ -265,7 +298,9 @@ pub async fn run(
         inputs: options.inputs.clone(),
         workflow_env,
         secret_values,
+        secrets_by_job,
         secret_redactions,
+        isolation: isolation_provider,
         jobs_root: workspace_root.clone(),
         logs_root: logs_root.clone(),
         no_cache: options.no_cache,
@@ -569,6 +604,16 @@ fn base_context(
     context
 }
 
+fn scoped_secrets(
+    representation: &str,
+    all: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    crate::secrets::referenced_secret_names(representation)
+        .into_iter()
+        .filter_map(|name| all.get(&name).map(|value| (name, value.clone())))
+        .collect()
+}
+
 fn needs_value(shared: &Shared, job: &IrJob) -> IndexMap<String, Value> {
     let mut needs = IndexMap::new();
     for need in &job.needs {
@@ -724,7 +769,7 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
         &shared.workflow_env,
         &Context::new(),
         Some(&job),
-        &shared.secret_values,
+        shared.job_secrets(&job.id),
     );
     context.success = needs_ok;
     context.failure = !needs_ok;
@@ -782,6 +827,46 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
             return fail_job_before_start(shared.as_ref(), job, report, error);
         }
     };
+    let lease_stop = CancellationToken::new();
+    let lease_heartbeat = lock.as_ref().map(|lease| {
+        let db = shared.db.clone();
+        let events = shared.events.clone();
+        let cancel = shared.cancel.clone();
+        let stop = lease_stop.clone();
+        let lease = lease.clone();
+        let run_id = shared.run_id.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tokio::time::sleep(CONCURRENCY_HEARTBEAT) => {
+                        match db.renew_concurrency_lease(&lease, now_ms(), CONCURRENCY_LEASE_MS) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                events.error(
+                                    &run_id,
+                                    format!(
+                                        "concurrency lease for group '{}' was lost; cancelling run",
+                                        lease.group
+                                    ),
+                                );
+                                cancel.cancel();
+                                break;
+                            }
+                            Err(error) => {
+                                events.error(
+                                    &run_id,
+                                    format!("cannot renew concurrency lease: {error}"),
+                                );
+                                cancel.cancel();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    });
 
     let mut attempts = 0u32;
     let max_attempts = job
@@ -828,10 +913,12 @@ async fn execute_job(shared: Arc<Shared>, job: IrJob) -> JobReport {
         tokio::time::sleep(delay).await;
     };
 
-    if let Some(group) = lock {
-        let _ = shared
-            .db
-            .release_concurrency_slot(&group, &format!("{}/{}", shared.run_id, job.id));
+    if let Some(lease) = &lock {
+        lease_stop.cancel();
+        if let Some(handle) = lease_heartbeat {
+            handle.abort();
+        }
+        let _ = shared.db.release_concurrency_lease(lease);
     }
 
     report.steps = outcome.steps;
@@ -970,10 +1057,20 @@ async fn execute_job_body(
     let mut packages: Vec<PackageRecord> = Vec::new();
     let mut pending_cache: Vec<PendingCacheSave> = Vec::new();
     let mut job_failed = false;
+    let isolation = match shared.isolation.as_ref() {
+        Some(provider) => match provider.prepare(&isolation::IsolationContext {
+            workspace: workspace.to_path_buf(),
+        }) {
+            Ok(session) => Some(session),
+            Err(error) => return JobOutcome::failed(error.into()),
+        },
+        None => None,
+    };
     let executor = Executor::new(ExecutorConfig {
         allowlist: crate::config::default_env_allowlist(),
         log_dir: Some(log_dir.to_path_buf()),
         verbose: shared.ui.verbose(),
+        isolation,
     })
     .with_secrets(shared.secret_redactions.clone());
 
@@ -995,7 +1092,7 @@ async fn execute_job_body(
             job_env,
             job_context,
             Some(job),
-            &shared.secret_values,
+            shared.job_secrets(&job.id),
         );
         context.success = !job_failed;
         context.failure = job_failed;
@@ -1159,7 +1256,7 @@ async fn execute_job_body(
             job_env,
             job_context,
             Some(job),
-            &shared.secret_values,
+            shared.job_secrets(&job.id),
         );
         context.success = true;
         context.insert("workspace", json!(workspace.to_string_lossy()));
@@ -1566,7 +1663,7 @@ async fn acquire_concurrency(
     shared: &Shared,
     job: &IrJob,
     _workspace: &Path,
-) -> Result<Option<String>> {
+) -> Result<Option<ConcurrencyLease>> {
     let Some(policy) = &job.concurrency else {
         return Ok(None);
     };
@@ -1584,12 +1681,14 @@ async fn acquire_concurrency(
                 "pipeline cancelled while waiting for concurrency group",
             ));
         }
-        if shared
-            .db
-            .acquire_concurrency_slot(group, &owner, max, now_ms(), 3_600_000)?
-            .is_some()
-        {
-            return Ok(Some(group.clone()));
+        if let Some(lease) = shared.db.acquire_concurrency_lease(
+            group,
+            &owner,
+            max,
+            now_ms(),
+            CONCURRENCY_LEASE_MS,
+        )? {
+            return Ok(Some(lease));
         }
         if policy.cancel_in_progress {
             for peer in shared.db.concurrency_owners(group)? {
@@ -1829,5 +1928,23 @@ struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_scope_only_contains_names_the_job_references() {
+        let all = BTreeMap::from([
+            ("DEPLOY_TOKEN".to_string(), "one".to_string()),
+            ("NPM_TOKEN".to_string(), "two".to_string()),
+        ]);
+        let job = r#"{"env":{"TOKEN":"${{ secrets.DEPLOY_TOKEN }}"}}"#;
+        let scoped = scoped_secrets(job, &all);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped["DEPLOY_TOKEN"], "one");
+        assert!(scoped_secrets(r#"{"env":{}}"#, &all).is_empty());
     }
 }

@@ -215,4 +215,15 @@ mod tests {
         let matrix = definition("a: [1,2,3]\nb: [1,2,3]\nc: [1,2,3]\n");
         assert!(expand(&matrix, 10).is_err());
     }
+
+    #[test]
+    fn rejects_explosion_beyond_the_default_limit() {
+        let values: Vec<String> = (0..DEFAULT_MAX_MATRIX_JOBS + 1)
+            .map(|index| format!("v{index}"))
+            .collect();
+        let matrix = definition(&format!("axis: [{}]\n", values.join(", ")));
+        let error = expand(&matrix, DEFAULT_MAX_MATRIX_JOBS).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ConfigInvalid);
+        assert!(error.message.contains("beyond the limit"), "{error}");
+    }
 }

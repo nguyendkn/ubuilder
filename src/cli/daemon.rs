@@ -11,7 +11,9 @@ use serde_json::json;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(not(windows))]
+use std::process::Stdio;
 use std::time::Duration;
 
 #[derive(Debug, Subcommand)]
@@ -39,8 +41,11 @@ pub struct StartArgs {
     /// Loopback webhook port; POST /hook triggers a run.
     #[arg(long)]
     pub webhook: Option<u16>,
+    /// Webhook bind address. Defaults to loopback.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind: String,
     /// Bearer token required by the webhook (or UBUILDER_WEBHOOK_TOKEN).
-    #[arg(long, env = "UBUILDER_WEBHOOK_TOKEN")]
+    #[arg(long, env = "UBUILDER_WEBHOOK_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
     /// Run once and exit instead of waiting for changes.
     #[arg(long)]
@@ -66,8 +71,37 @@ pub fn run(cli: &Cli, command: &DaemonCommand, ui: &Ui) -> Result<i32> {
     }
 }
 
+fn validate_webhook(args: &StartArgs) -> Result<()> {
+    if args.webhook.is_some() {
+        if args
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .is_none()
+        {
+            return Err(UbuilderError::new(
+                ErrorCode::ConfigInvalid,
+                "webhook authentication is required",
+            )
+            .remediation(
+                "Pass --token or set UBUILDER_WEBHOOK_TOKEN; unauthenticated hooks are rejected",
+            ));
+        }
+        args.bind.parse::<std::net::IpAddr>().map_err(|_| {
+            UbuilderError::new(
+                ErrorCode::ConfigInvalid,
+                format!("invalid webhook bind address '{}'", args.bind),
+            )
+            .remediation("Use an IP address such as 127.0.0.1 or ::1")
+        })?;
+    }
+    Ok(())
+}
+
 fn start(cli: &Cli, args: &StartArgs, ui: &Ui) -> Result<i32> {
     let paths = Paths::new(cli, args.file.as_deref())?;
+    validate_webhook(args)?;
     if !paths.workflow.is_file() {
         let error = UbuilderError::new(
             ErrorCode::ConfigInvalid,
@@ -88,46 +122,41 @@ fn start(cli: &Cli, args: &StartArgs, ui: &Ui) -> Result<i32> {
         .map_err(|e| UbuilderError::io(format!("cannot create {}", paths.dir.display()), e))?;
     let exe = std::env::current_exe()
         .map_err(|e| UbuilderError::io("cannot locate ubuilder executable", e))?;
-    let mut child = Command::new(exe);
-    child
-        .arg("--path")
-        .arg(&paths.root)
-        .arg("--json")
-        .arg("daemon")
-        .arg("run")
-        .arg("--interval-secs")
-        .arg(args.interval_secs.to_string());
+    let mut argv = vec![
+        "--path".to_string(),
+        paths.root.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "daemon".to_string(),
+        "run".to_string(),
+        "--interval-secs".to_string(),
+        args.interval_secs.to_string(),
+    ];
     if let Some(file) = &args.file {
-        child.arg("--file").arg(file);
+        argv.push("--file".into());
+        argv.push(file.to_string_lossy().to_string());
     }
     if let Some(port) = args.webhook {
-        child.arg("--webhook").arg(port.to_string());
-    }
-    if let Some(token) = &args.token {
-        child.arg("--token").arg(token);
+        argv.push("--webhook".into());
+        argv.push(port.to_string());
+        argv.push("--bind".into());
+        argv.push(args.bind.clone());
     }
     if args.once {
-        child.arg("--once");
+        argv.push("--once".into());
     }
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.log)
-        .map_err(|e| UbuilderError::io(format!("cannot open {}", paths.log.display()), e))?;
-    let err = log
-        .try_clone()
-        .map_err(|e| UbuilderError::io("cannot clone daemon log", e))?;
-    child.stdout(Stdio::from(log)).stderr(Stdio::from(err));
-    let child = child
-        .spawn()
-        .map_err(|e| UbuilderError::io("cannot start daemon", e))?;
-    let pid = child.id();
+    let pid = spawn_daemon(
+        &exe,
+        &argv,
+        args.token.as_deref(),
+        &paths.log,
+        &paths.err_log,
+    )?;
     write_pid(&paths.pid, pid)?;
     // Give the child a moment to bind the webhook and write its pid.
     std::thread::sleep(Duration::from_millis(250));
     if !process_alive(pid) {
         let error = UbuilderError::new(ErrorCode::Io, "daemon exited during startup")
-            .details(json!({ "log": paths.log }));
+            .details(json!({ "log": paths.log, "err_log": paths.err_log }));
         return Ok(fail(ui, "daemon start", &error, None));
     }
     if !ui.json() {
@@ -139,6 +168,128 @@ fn start(cli: &Cli, args: &StartArgs, ui: &Ui) -> Result<i32> {
         "daemon start",
         json!({ "running": true, "pid": pid, "log": paths.log, "webhook": args.webhook }),
     ))
+}
+
+/// Spawn a process that must outlive the calling shell. Detaching matters on
+/// Windows: `CreateProcess` inherits inheritable handles, so a directly
+/// spawned daemon would keep a caller's `| jq` pipe open for its lifetime.
+fn spawn_daemon(
+    exe: &Path,
+    argv: &[String],
+    token: Option<&str>,
+    stdout: &Path,
+    stderr: &Path,
+) -> Result<u32> {
+    #[cfg(windows)]
+    {
+        // PowerShell's `-RedirectStandard*` keeps the launcher alive for the
+        // child's lifetime and reintroduces the inherited-handle problem, so
+        // the daemon writes run output itself and inherits no caller pipe.
+        for path in [stdout, stderr] {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| UbuilderError::io(format!("cannot open {}", path.display()), e))?;
+        }
+        let commandline = argv
+            .iter()
+            .map(|arg| quote_windows_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script = format!(
+            "$p = Start-Process -WindowStyle Hidden -FilePath {} -ArgumentList {} -PassThru; $p.Id",
+            ps_quote(&exe.to_string_lossy()),
+            ps_quote(&commandline),
+        );
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        if let Some(token) = token {
+            command.env("UBUILDER_WEBHOOK_TOKEN", token);
+        }
+        let output = command
+            .output()
+            .map_err(|e| UbuilderError::io("cannot start daemon", e))?;
+        if !output.status.success() {
+            return Err(UbuilderError::new(
+                ErrorCode::Io,
+                format!(
+                    "daemon launcher failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            ));
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| {
+                UbuilderError::new(
+                    ErrorCode::Io,
+                    format!(
+                        "daemon launcher did not return a pid: {}",
+                        String::from_utf8_lossy(&output.stdout).trim()
+                    ),
+                )
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(stdout)
+            .map_err(|e| UbuilderError::io(format!("cannot open {}", stdout.display()), e))?;
+        let err = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(stderr)
+            .map_err(|e| UbuilderError::io(format!("cannot open {}", stderr.display()), e))?;
+        let mut command = Command::new(exe);
+        command
+            .args(argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err));
+        if let Some(token) = token {
+            command.env("UBUILDER_WEBHOOK_TOKEN", token);
+        }
+        command
+            .spawn()
+            .map(|child| child.id())
+            .map_err(|e| UbuilderError::io("cannot start daemon", e))
+    }
+}
+
+#[cfg(windows)]
+fn ps_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for character in arg.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                quoted.push(character);
+            }
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes));
+    quoted.push('"');
+    quoted
 }
 
 fn stop(cli: &Cli, ui: &Ui) -> Result<i32> {
@@ -220,6 +371,7 @@ fn trigger(cli: &Cli, ui: &Ui) -> Result<i32> {
 
 fn run_loop(cli: &Cli, args: &StartArgs, ui: &Ui) -> Result<i32> {
     let paths = Paths::new(cli, args.file.as_deref())?;
+    validate_webhook(args)?;
     std::fs::create_dir_all(&paths.dir)
         .map_err(|e| UbuilderError::io(format!("cannot create {}", paths.dir.display()), e))?;
     write_pid(&paths.pid, std::process::id())?;
@@ -227,19 +379,29 @@ fn run_loop(cli: &Cli, args: &StartArgs, ui: &Ui) -> Result<i32> {
     let token = args.token.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     if let Some(port) = args.webhook {
-        let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
-            UbuilderError::io(format!("cannot bind webhook 127.0.0.1:{port}"), e)
+        let address: std::net::IpAddr = args.bind.parse().map_err(|_| {
+            UbuilderError::new(
+                ErrorCode::ConfigInvalid,
+                format!("invalid webhook bind address '{}'", args.bind),
+            )
+        })?;
+        let listener = TcpListener::bind((address, port)).map_err(|e| {
+            UbuilderError::io(format!("cannot bind webhook {}:{port}", args.bind), e)
                 .remediation("Choose another --webhook port or stop the process using it")
         })?;
         let tx = tx.clone();
+        let token = token.clone().ok_or_else(|| {
+            UbuilderError::new(ErrorCode::ConfigInvalid, "webhook token is required")
+        })?;
         std::thread::spawn(move || {
+            let mut limits = WebhookLimits::default();
             for stream in listener.incoming().flatten() {
-                if serve(stream, token.as_deref()) {
+                if serve(stream, &token, &mut limits) {
                     let _ = tx.send(());
                 }
             }
         });
-        eprintln!("webhook listening on http://127.0.0.1:{port}/hook");
+        eprintln!("webhook listening on http://{}:{port}/hook", args.bind);
     }
     let interval = Duration::from_secs(args.interval_secs.max(1));
     let mut force = args.once;
@@ -324,38 +486,186 @@ fn run_workflow(paths: &Paths) -> Result<()> {
     }
 }
 
-fn serve(mut stream: std::net::TcpStream, token: Option<&str>) -> bool {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let mut buffer = [0u8; 8192];
-    let read = stream.read(&mut buffer).unwrap_or(0);
-    let request = String::from_utf8_lossy(&buffer[..read]);
-    let mut lines = request.lines();
-    let request_line = lines.next().unwrap_or_default();
-    let mut authorized = token.is_none();
-    let mut method_ok = false;
-    if let Some(method) = request_line.split_whitespace().next() {
-        method_ok = method == "POST";
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_BODY_BYTES: usize = 64 * 1024;
+const RATE_LIMIT_REQUESTS: u32 = 60;
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const DEDUP_CAPACITY: usize = 1024;
+
+struct WebhookLimits {
+    window_start: std::time::Instant,
+    window_count: u32,
+    seen: std::collections::HashSet<String>,
+    seen_order: std::collections::VecDeque<String>,
+}
+
+impl Default for WebhookLimits {
+    fn default() -> Self {
+        Self {
+            window_start: std::time::Instant::now(),
+            window_count: 0,
+            seen: std::collections::HashSet::new(),
+            seen_order: std::collections::VecDeque::new(),
+        }
     }
+}
+
+impl WebhookLimits {
+    fn allow_request(&mut self) -> bool {
+        if self.window_start.elapsed() >= RATE_LIMIT_WINDOW {
+            self.window_start = std::time::Instant::now();
+            self.window_count = 0;
+        }
+        self.window_count += 1;
+        self.window_count <= RATE_LIMIT_REQUESTS
+    }
+
+    /// Returns `true` when the delivery id was already accepted.
+    fn duplicate(&mut self, delivery: Option<&str>) -> bool {
+        let Some(delivery) = delivery.filter(|value| !value.trim().is_empty()) else {
+            return false;
+        };
+        if self.seen.contains(delivery) {
+            return true;
+        }
+        self.seen.insert(delivery.to_string());
+        self.seen_order.push_back(delivery.to_string());
+        while self.seen_order.len() > DEDUP_CAPACITY {
+            if let Some(old) = self.seen_order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        false
+    }
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        difference |= a ^ b;
+    }
+    difference == 0
+}
+
+struct HttpRequest {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    content_length: usize,
+}
+
+impl HttpRequest {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+fn read_request(stream: &mut std::net::TcpStream) -> Result<HttpRequest> {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 2048];
+    let header_end = loop {
+        if raw.len() > MAX_HEADER_BYTES {
+            return Ok(HttpRequest {
+                method: String::new(),
+                path: String::new(),
+                headers: Vec::new(),
+                content_length: MAX_BODY_BYTES + 1,
+            });
+        }
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|e| UbuilderError::io("cannot read webhook request", e))?;
+        if read == 0 {
+            break None;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+        if let Some(index) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            break Some(index + 4);
+        }
+    };
+    let header_end = header_end.unwrap_or(raw.len());
+    let text = String::from_utf8_lossy(&raw[..header_end]);
+    let mut lines = text.lines();
+    let request_line = lines.next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let path = parts.next().unwrap_or_default().to_string();
+    let mut headers = Vec::new();
     for line in lines {
         if line.is_empty() {
             break;
         }
         if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("authorization") && token.is_some() {
-                authorized = value.trim() == format!("Bearer {}", token.unwrap_or_default());
-            }
-            if name.eq_ignore_ascii_case("x-ubuilder-token") {
-                authorized = token == Some(value.trim());
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    let content_length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    Ok(HttpRequest {
+        method,
+        path,
+        headers,
+        content_length,
+    })
+}
+
+fn authorized(request: &HttpRequest, token: &str) -> bool {
+    if let Some(value) = request.header("authorization") {
+        if let Some(bearer) = value.strip_prefix("Bearer ") {
+            if constant_time_eq(bearer.trim(), token) {
+                return true;
             }
         }
     }
-    let (status, body) = if method_ok && authorized {
-        ("202 Accepted", "queued")
-    } else if !method_ok {
-        ("405 Method Not Allowed", "POST /hook required")
-    } else {
-        ("401 Unauthorized", "invalid token")
+    request
+        .header("x-ubuilder-token")
+        .is_some_and(|value| constant_time_eq(value.trim(), token))
+}
+
+fn serve(mut stream: std::net::TcpStream, token: &str, limits: &mut WebhookLimits) -> bool {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let request = match read_request(&mut stream) {
+        Ok(request) => request,
+        Err(_) => return respond(&mut stream, "400 Bad Request", "malformed request"),
     };
+    if request.content_length > MAX_BODY_BYTES {
+        return respond(
+            &mut stream,
+            "413 Payload Too Large",
+            "request body too large",
+        );
+    }
+    if request.method != "POST" || request.path != "/hook" {
+        return respond(&mut stream, "405 Method Not Allowed", "POST /hook required");
+    }
+    if !limits.allow_request() {
+        return respond(&mut stream, "429 Too Many Requests", "rate limit exceeded");
+    }
+    if !authorized(&request, token) {
+        return respond(&mut stream, "401 Unauthorized", "invalid token");
+    }
+    let delivery = request
+        .header("x-ubuilder-delivery")
+        .or_else(|| request.header("x-github-delivery"));
+    if limits.duplicate(delivery) {
+        return respond(&mut stream, "409 Conflict", "duplicate delivery");
+    }
+    respond(&mut stream, "202 Accepted", "queued")
+}
+
+fn respond(stream: &mut std::net::TcpStream, status: &str, body: &str) -> bool {
     let _ = write!(
         stream,
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{body}",
@@ -388,6 +698,7 @@ struct Paths {
     state: PathBuf,
     trigger: PathBuf,
     log: PathBuf,
+    err_log: PathBuf,
     run_log: PathBuf,
 }
 
@@ -405,6 +716,7 @@ impl Paths {
             state: dir.join("state.json"),
             trigger: dir.join("trigger"),
             log: dir.join("daemon.log"),
+            err_log: dir.join("daemon.err.log"),
             run_log: dir.join("runs.log"),
             dir,
         })
@@ -469,11 +781,11 @@ fn process_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn kill_process(pid: u32) -> Result<()> {
-    let status = Command::new("taskkill")
+    let output = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .status()
+        .output()
         .map_err(|e| UbuilderError::io("cannot stop daemon", e))?;
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
         Err(UbuilderError::new(
@@ -485,16 +797,116 @@ fn kill_process(pid: u32) -> Result<()> {
 
 #[cfg(not(windows))]
 fn kill_process(pid: u32) -> Result<()> {
-    let status = Command::new("kill")
+    let output = Command::new("kill")
         .args(["-TERM", &pid.to_string()])
-        .status()
+        .output()
         .map_err(|e| UbuilderError::io("cannot stop daemon", e))?;
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
         Err(UbuilderError::new(
             ErrorCode::Io,
             format!("kill failed for pid {pid}"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpStream;
+
+    fn exchange(mut limits: WebhookLimits, request: &str) -> (WebhookLimits, String, bool) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = request.to_string();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let accepted = serve(stream, "s3cret", &mut limits);
+            (limits, accepted)
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        let (limits, accepted) = server.join().unwrap();
+        (limits, response, accepted)
+    }
+
+    fn post(headers: &str) -> String {
+        format!("POST /hook HTTP/1.1\r\nHost: localhost\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    #[test]
+    fn rejects_missing_and_wrong_authentication() {
+        let (_, response, accepted) = exchange(WebhookLimits::default(), &post(""));
+        assert!(!accepted);
+        assert!(response.starts_with("HTTP/1.1 401"));
+
+        let (_, response, accepted) = exchange(
+            WebhookLimits::default(),
+            &post("Authorization: Bearer wrong\r\n"),
+        );
+        assert!(!accepted);
+        assert!(response.starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
+    fn accepts_bearer_and_header_tokens() {
+        let (_, response, accepted) = exchange(
+            WebhookLimits::default(),
+            &post("Authorization: Bearer s3cret\r\n"),
+        );
+        assert!(accepted);
+        assert!(response.starts_with("HTTP/1.1 202"));
+
+        let (_, response, accepted) = exchange(
+            WebhookLimits::default(),
+            &post("X-Ubuilder-Token: s3cret\r\n"),
+        );
+        assert!(accepted);
+        assert!(response.starts_with("HTTP/1.1 202"));
+    }
+
+    #[test]
+    fn rejects_wrong_method_and_path() {
+        let request =
+            "GET /hook HTTP/1.1\r\nAuthorization: Bearer s3cret\r\nContent-Length: 0\r\n\r\n";
+        let (_, response, accepted) = exchange(WebhookLimits::default(), request);
+        assert!(!accepted);
+        assert!(response.starts_with("HTTP/1.1 405"));
+    }
+
+    #[test]
+    fn rejects_oversized_bodies_before_reading_them() {
+        let request = post("Authorization: Bearer s3cret\r\nContent-Length: 70000\r\n");
+        let (_, response, accepted) = exchange(WebhookLimits::default(), &request);
+        assert!(!accepted);
+        assert!(response.starts_with("HTTP/1.1 413"));
+    }
+
+    #[test]
+    fn duplicate_deliveries_are_rejected() {
+        let request = post("Authorization: Bearer s3cret\r\nX-Ubuilder-Delivery: delivery-1\r\n");
+        let (limits, response, accepted) = exchange(WebhookLimits::default(), &request);
+        assert!(accepted);
+        assert!(response.starts_with("HTTP/1.1 202"));
+        let (_, response, accepted) = exchange(limits, &request);
+        assert!(!accepted);
+        assert!(response.starts_with("HTTP/1.1 409"));
+    }
+
+    #[test]
+    fn rate_limit_and_constant_time_comparison() {
+        let limits = WebhookLimits {
+            window_count: RATE_LIMIT_REQUESTS,
+            ..WebhookLimits::default()
+        };
+        let (_, response, accepted) = exchange(limits, &post("Authorization: Bearer s3cret\r\n"));
+        assert!(!accepted);
+        assert!(response.starts_with("HTTP/1.1 429"));
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "ab"));
     }
 }

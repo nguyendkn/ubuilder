@@ -72,18 +72,24 @@ impl PipelineAction for CacheAction {
     ) -> Result<ActionOutcome> {
         context.check_cancel()?;
         let key = require_input(inputs, "key")?;
+        // The same action key can be evaluated by several jobs, including
+        // matrix siblings whose job id encodes the target. Their restored
+        // bytes are not interchangeable.
+        let cache_key = format!("{}|job={}", key, context.job_id);
         let relative = require_input(inputs, "path")?;
         let _ = resolve_workspace_path(context.workspace, relative)?;
         let restore = parse_bool(input(inputs, "restore"), true);
         let save = parse_bool(input(inputs, "save"), true);
         let hit = if restore {
-            context.cache.restore(key, context.workspace, relative)?
+            context
+                .cache
+                .restore(&cache_key, context.workspace, relative)?
         } else {
             false
         };
         if !hit && save {
             context.pending_cache.push(PendingCacheSave {
-                key: key.to_string(),
+                key: cache_key,
                 path: relative.to_string(),
             });
         }

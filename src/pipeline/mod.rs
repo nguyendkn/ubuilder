@@ -13,6 +13,7 @@ pub mod expression;
 pub mod graph;
 pub mod history;
 pub mod ir;
+pub mod isolation;
 pub mod matrix;
 pub mod parser;
 pub mod planner;

@@ -54,12 +54,14 @@ pub fn compile(parsed: &ParsedWorkflow, host: &Host) -> Result<WorkflowIr> {
         }
     }
     let (order, waves) = dependency_order(&jobs)?;
+    definition.security.validate()?;
     Ok(WorkflowIr {
         version: definition.version,
         name: definition.name.clone(),
         source_path: parsed.path.clone(),
         source_digest: parsed.digest.clone(),
         env: compile_templates(&definition.env, &parsed.path, "env")?,
+        security: definition.security.clone(),
         jobs,
         order,
         waves,

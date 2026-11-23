@@ -170,6 +170,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_yaml_alias_expansion_bombs() {
+        let mut source = String::from(
+            "version: 1\nname: Alias\njobs:\n  build:\n    strategy:\n      matrix:\n        seed: &seed [a, b, c, d, e, f, g, h, i, j]\n",
+        );
+        let mut previous = "seed".to_string();
+        for level in 1..=7 {
+            source.push_str(&format!("        level{level}: &level{level} ["));
+            for _ in 0..10 {
+                source.push_str(&format!("*{previous}, "));
+            }
+            source.push_str("]\n");
+            previous = format!("level{level}");
+        }
+        source.push_str("    steps:\n      - run: echo hi\n");
+        let error = ParsedWorkflow::parse(&path(), source).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ConfigInvalid, "{error}");
+        assert!(
+            error.message.contains("repetition limit"),
+            "alias bomb must be rejected by the YAML expansion limit: {error}"
+        );
+    }
+
+    #[test]
     fn parses_minimal_workflow() {
         let workflow = ParsedWorkflow::parse(
             &path(),

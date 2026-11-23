@@ -30,7 +30,8 @@ pub struct SetArgs {
     /// Read the value from standard input (noninteractive CI).
     #[arg(long, conflicts_with_all = ["value", "file"])]
     pub stdin: bool,
-    /// Literal value. Visible in shell history and process listings.
+    /// Literal value. Deprecated: visible in shell history and process
+    /// listings; prefer `--stdin` or interactive input.
     #[arg(long, conflicts_with_all = ["stdin", "file"])]
     pub value: Option<String>,
 }
@@ -62,6 +63,9 @@ pub fn run(_cli: &Cli, command: &SecretCommand, ui: &Ui) -> Result<i32> {
         SecretCommand::Set(args) => {
             if let Err(error) = validate_name(&args.name) {
                 return Ok(fail(ui, "secret set", &error, None));
+            }
+            if args.value.is_some() && !ui.json() {
+                ui.warn("--value is visible in shell history; prefer --stdin");
             }
             let value = match read_value(args) {
                 Ok(value) => value,

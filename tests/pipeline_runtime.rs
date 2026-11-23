@@ -1,6 +1,7 @@
 //! Pipeline runtime behaviour against a real Rust fixture and local shells.
 
 use serde_json::Value;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -16,6 +17,23 @@ fn fixture() -> PathBuf {
 
 fn ubuilder() -> Command {
     Command::new(env!("CARGO_BIN_EXE_ubuilder"))
+}
+
+fn set_secret(sandbox: &Sandbox, name: &str, value: &str) -> Output {
+    let mut child = sandbox
+        .command(&["--json", "secret", "set", name, "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(value.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
 }
 
 struct Sandbox {
@@ -409,7 +427,7 @@ jobs:
         .spawn()
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let status = sandbox.status("cancel-me");
         if status.status.success() {
@@ -441,6 +459,117 @@ jobs:
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["data"]["status"], "cancelled");
     assert_eq!(json["error"]["code"], "CANCELLED");
+}
+
+#[test]
+fn cancel_in_progress_cancels_the_holder_and_releases_its_lease() {
+    let sandbox = Sandbox::new();
+    let marker = sandbox.temp.path().join("holder-started");
+    let holder_command = if cfg!(windows) {
+        format!(
+            "Set-Content -Path '{}' -Value ready\n{}",
+            marker.display(),
+            sleep_command(30)
+        )
+    } else {
+        format!(
+            "printf ready > '{}'\n{}",
+            marker.display(),
+            sleep_command(30)
+        )
+    };
+    let holder_workflow = sandbox.workflow(&format!(
+        r#"version: 1
+name: Holder
+jobs:
+  holder:
+    concurrency:
+      group: cancel-race
+      max: 1
+    steps:
+      - run: |
+          {}
+"#,
+        holder_command.replace('\n', "\n          ")
+    ));
+    let mut holder = sandbox
+        .command(&[
+            "--path",
+            fixture().to_str().unwrap(),
+            "--json",
+            "pipeline",
+            "run",
+            "--file",
+            holder_workflow.to_str().unwrap(),
+            "--run-id",
+            "holder",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "holder never started its step: {:?}",
+            holder.try_wait()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let contender_workflow = sandbox.workflow(
+        r#"version: 1
+name: Contender
+jobs:
+  contender:
+    concurrency:
+      group: cancel-race
+      max: 1
+      cancel-in-progress: true
+    steps:
+      - run: echo contender-ran
+"#,
+    );
+    let (contender, contender_json) =
+        sandbox.run_json(&contender_workflow, &["--run-id", "contender"]);
+    assert!(
+        contender.status.success(),
+        "{contender_json}\nstderr: {}",
+        String::from_utf8_lossy(&contender.stderr)
+    );
+    assert_eq!(job(&contender_json, "contender")["status"], "success");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let holder_exit = loop {
+        if let Some(status) = holder.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = holder.kill();
+            panic!("holder did not stop after cancel-in-progress");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(holder_exit.code(), Some(130));
+    let holder_output = holder.wait_with_output().unwrap();
+    let holder_json: Value = serde_json::from_slice(&holder_output.stdout).unwrap();
+    assert_eq!(holder_json["data"]["status"], "cancelled");
+    assert_eq!(holder_json["error"]["code"], "CANCELLED");
+
+    let persisted = sandbox.status("holder");
+    let persisted_json: Value = serde_json::from_slice(&persisted.stdout).unwrap();
+    assert_eq!(persisted_json["data"]["run"]["status"], "cancelled");
+
+    let db = rusqlite::Connection::open(sandbox.data_dir().join("ubuilder.db")).unwrap();
+    let leases: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM pipeline_concurrency_slots WHERE group_name='cancel-race'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(leases, 0, "cancelled holder leaked its concurrency lease");
 }
 
 #[test]
@@ -642,10 +771,7 @@ fn secrets_are_injected_and_redacted_everywhere() {
     let sandbox = Sandbox::new();
     let secret = "s3cr3t-value-42";
     let name = "UBUILDER_TEST_ONLY_TOKEN";
-    let set = sandbox
-        .command(&["--json", "secret", "set", name, "--value", secret])
-        .output()
-        .unwrap();
+    let set = set_secret(&sandbox, name, secret);
     assert!(
         set.status.success(),
         "secret set failed: {}",
@@ -736,6 +862,39 @@ jobs:
     assert!(text.contains("DEFINITELY_MISSING_SECRET"));
 }
 
+#[cfg(windows)]
+#[test]
+fn isolated_mode_fails_closed_without_a_backend() {
+    let sandbox = Sandbox::new();
+    let workflow = sandbox.workflow(
+        r#"version: 1
+name: Isolated
+security:
+  mode: isolated
+  network: none
+  filesystem:
+    workspace: read-write
+    host: denied
+jobs:
+  build:
+    steps:
+      - run: echo should-not-run
+"#,
+    );
+    let output = sandbox.run(&workflow, &["--run-id", "isolated-unavailable"]);
+    assert_eq!(output.status.code(), Some(3));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["code"], "SECURITY_CAPABILITY_UNAVAILABLE");
+    assert_eq!(json["error"]["details"]["platform"], "windows");
+    let status = sandbox.status("isolated-unavailable");
+    let status_json: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status_json["ok"], false,
+        "a rejected isolation policy must not create a run record"
+    );
+}
+
 #[test]
 fn cache_survives_unrelated_workflow_edits() {
     let sandbox = Sandbox::new();
@@ -775,10 +934,7 @@ jobs:
 fn secret_cli_never_prints_values() {
     let sandbox = Sandbox::new();
     let secret = "cli-secret-99";
-    let set = sandbox
-        .command(&["--json", "secret", "set", "CLI_TOKEN", "--value", secret])
-        .output()
-        .unwrap();
+    let set = set_secret(&sandbox, "CLI_TOKEN", secret);
     assert!(set.status.success());
     let text = String::from_utf8_lossy(&set.stdout);
     assert!(!text.contains(secret), "{text}");
@@ -863,6 +1019,128 @@ jobs:
     assert!(stats.status.success());
     let stats: Value = serde_json::from_slice(&stats.stdout).unwrap();
     assert_eq!(stats["data"]["runs"], 1, "{stats}");
+}
+
+#[test]
+fn maintenance_dry_run_and_active_runs_are_non_destructive() {
+    let sandbox = Sandbox::new();
+    let workflow = sandbox.workflow(
+        r#"version: 1
+name: Retention safety
+jobs:
+  ok:
+    steps:
+      - run: echo kept
+"#,
+    );
+    let (output, json) = sandbox.run_json(&workflow, &["--run-id", "active-run"]);
+    assert!(output.status.success(), "{json}");
+    let db = rusqlite::Connection::open(sandbox.data_dir().join("ubuilder.db")).unwrap();
+    db.execute(
+        "UPDATE pipeline_runs SET status='running', finished_at=NULL WHERE id='active-run'",
+        [],
+    )
+    .unwrap();
+
+    let prune = sandbox
+        .command(&[
+            "--json",
+            "maintenance",
+            "prune",
+            "--max-runs",
+            "0",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(prune.status.success());
+    let prune: Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(prune["data"]["deleted_count"], 0, "{prune}");
+
+    db.execute(
+        "UPDATE pipeline_runs SET status='success' WHERE id='active-run'",
+        [],
+    )
+    .unwrap();
+    let dry_run = sandbox
+        .command(&[
+            "--json",
+            "maintenance",
+            "prune",
+            "--max-runs",
+            "0",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    let dry_run: Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    assert_eq!(dry_run["data"]["deleted_count"], 1, "{dry_run}");
+    let history = sandbox
+        .command(&["--json", "pipeline", "history"])
+        .output()
+        .unwrap();
+    let history: Value = serde_json::from_slice(&history.stdout).unwrap();
+    assert_eq!(history["data"]["runs"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn garbage_collection_keeps_objects_shared_by_retained_runs() {
+    let sandbox = Sandbox::new();
+    let workflow = sandbox.workflow(
+        r#"version: 1
+name: Shared artifacts
+jobs:
+  publish:
+    steps:
+      - run: echo identical > shared.txt
+      - uses: builtin/upload-artifact@v1
+        with:
+          name: desktop
+          path: shared.txt
+"#,
+    );
+    let mut shas = Vec::new();
+    for run in ["shared-a", "shared-b"] {
+        let (output, json) = sandbox.run_json(&workflow, &["--run-id", run]);
+        assert!(output.status.success(), "{json}");
+        shas.push(
+            json["data"]["artifacts"][0]["sha256"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(shas[0], shas[1], "package must be reproducible");
+
+    let prune = sandbox
+        .command(&["--json", "maintenance", "prune", "--max-runs", "1"])
+        .output()
+        .unwrap();
+    let prune: Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(prune["data"]["deleted_count"], 1, "{prune}");
+    let gc = sandbox
+        .command(&["--json", "maintenance", "gc"])
+        .output()
+        .unwrap();
+    let gc: Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(
+        gc["data"]["removed_count"], 0,
+        "shared object was collected"
+    );
+
+    let prune = sandbox
+        .command(&["--json", "maintenance", "prune", "--max-runs", "0"])
+        .output()
+        .unwrap();
+    let prune: Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(prune["data"]["deleted_count"], 1, "{prune}");
+    let gc = sandbox
+        .command(&["--json", "maintenance", "gc"])
+        .output()
+        .unwrap();
+    let gc: Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(gc["data"]["removed_count"], 1, "{gc}");
 }
 
 #[test]

@@ -162,4 +162,16 @@ mod tests {
     fn rejects_unterminated_interpolation() {
         assert!(Template::parse("${{ matrix.target").is_err());
     }
+
+    #[test]
+    fn rejects_oversized_expressions_and_templates() {
+        let oversized = "true".repeat(MAX_EXPRESSION_LENGTH);
+        assert!(Expression::parse(oversized).is_err());
+
+        let mut template = String::new();
+        for index in 0..129 {
+            template.push_str(&format!("${{{{ matrix.axis{index} }}}}"));
+        }
+        assert!(Template::parse(template).is_err());
+    }
 }
